@@ -1,0 +1,87 @@
+//你是tradingview的专家，你用如下Pine Script代码对k线进行包含关系的合并处理，并对合并k线标记顶分型top和底分型down
+
+//@version=6
+indicator("合并K线与分型标记", overlay=true)
+
+// 模拟结构体的多个数组
+var openArr  = array.new_float()
+var highArr  = array.new_float()
+var lowArr   = array.new_float()
+var closeArr = array.new_float()
+var timeArr  = array.new_int()
+
+// 初始化当前合并K线的变量
+var float curOpen  = na
+var float curHigh  = na
+var float curLow   = na
+var float curClose = na
+var int   curTime  = na
+
+// 判断是否有包含关系
+isInside(ph, pl, ch, cl) =>
+    (ch <= ph and cl >= pl) or (ch >= ph and cl <= pl)
+
+// 处理K线合并逻辑
+if bar_index == 0
+    // 初始化
+    curOpen  := open
+    curHigh  := high
+    curLow   := low
+    curClose := close
+    curTime  := time
+else
+    if isInside(curHigh, curLow, high, low)
+        // 有包含关系，更新当前合并K线
+        curHigh  := math.max(curHigh, high)
+        curLow   := math.min(curLow, low)
+        curClose := close
+    else
+        // 无包含关系，存储上一根合并K线，开始新的合并
+        array.push(openArr,  curOpen)
+        array.push(highArr,  curHigh)
+        array.push(lowArr,   curLow)
+        array.push(closeArr, curClose)
+        array.push(timeArr,  curTime)
+
+        // 重新初始化
+        curOpen  := open
+        curHigh  := high
+        curLow   := low
+        curClose := close
+        curTime  := time
+
+// 最后一根bar时，推入当前合并K线
+if barstate.islast
+    array.push(openArr,  curOpen)
+    array.push(highArr,  curHigh)
+    array.push(lowArr,   curLow)
+    array.push(closeArr, curClose)
+    array.push(timeArr,  curTime)
+
+// 标记分型（确保至少3根合并K线）
+if array.size(openArr) >= 3
+    for i = 1 to array.size(openArr) - 2
+        float hl = array.get(highArr, i - 1)
+        float ml = array.get(highArr, i)
+        float rl = array.get(highArr, i + 1)
+
+        float ll = array.get(lowArr, i - 1)
+        float mlow = array.get(lowArr, i)
+        float rlw = array.get(lowArr, i + 1)
+
+        int t = array.get(timeArr, i)
+        float h = array.get(highArr, i)
+        float l = array.get(lowArr, i)
+
+        // 三根无包含关系
+        noContain = not isInside(hl, ll, ml, mlow) and not isInside(ml, mlow, rl, rlw)
+
+        if noContain
+            isTop = ml > hl and ml > rl and mlow > ll and mlow > rlw
+            isDown = ml < hl and ml < rl and mlow < ll and mlow < rlw
+
+            if isTop
+                label.new(t, h, "Top", style=label.style_label_down, color=color.red, textcolor=color.white, xloc=xloc.bar_time)
+
+            if isDown
+                label.new(t, l, "Down", style=label.style_label_up, color=color.green, textcolor=color.white, xloc=xloc.bar_time)
