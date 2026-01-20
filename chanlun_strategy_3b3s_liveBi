@@ -1,0 +1,2361 @@
+//@version=6
+strategy("ChanLun + MACD (WIP) Strategy", overlay=true, max_labels_count=500, max_lines_count=500, max_boxes_count=500, initial_capital=300000, default_qty_type=strategy.percent_of_equity, default_qty_value=99, commission_type=strategy.commission.percent, commission_value=0.0177, slippage=0, pyramiding=0)
+
+stopLossPct = input.float(1.0, "Stop Loss (%)", minval=0.0, step=0.1, group="Strategy")
+
+var int lastStrategyEntryBar = na
+var int lastStrategyExitBar = na
+
+var dbgStrategyLabels = array.new_label()
+var int dbgEntryId = 0
+var int dbgPendingEntryId = na
+var int dbgPrevOpenTrades = na
+var int dbgPrevClosedTrades = na
+
+var int dbgLastEntryCallBar = na
+var int dbgLastEntryCallId = na
+var int dbgLastEntryCallOt = na
+var int dbgLastEntryCallCt = na
+var int dbgLastEntryCallExitBar = na
+var float dbgLastEntryCallEquity = na
+var int dbgLastEntryCallTime = na
+var bool dbgLastEntryCallConfirmed = false
+var bool dbgLastEntryCallRealtime = false
+var float dbgLastEntryCallPointValue = na
+var float dbgLastEntryCallQtyEst = na
+
+f_dbgKeepLabel(label l, int maxN) =>
+    if maxN > 0
+        array.push(dbgStrategyLabels, l)
+        while array.size(dbgStrategyLabels) > maxN
+            label.delete(array.shift(dbgStrategyLabels))
+    else
+        label.delete(l)
+
+f_dbgEntryCallLabel(int x, float y, int id, int srcBar, float pos, float eq, float o, float v, int t, bool conf, bool rt, float pv, float qEst) =>
+    string msg = "dbg:entry call id=" + str.tostring(id)
+    msg := msg + " srcBar=" + str.tostring(srcBar)
+    msg := msg + " pos=" + str.tostring(pos)
+    msg := msg + " eq=" + str.tostring(eq)
+    msg := msg + " o=" + str.tostring(o)
+    msg := msg + " v=" + str.tostring(v)
+    msg := msg + " t=" + str.tostring(t)
+    msg := msg + " conf=" + str.tostring(conf)
+    msg := msg + " rt=" + str.tostring(rt)
+    msg := msg + " pv=" + str.tostring(pv)
+    msg := msg + " qEst=" + str.tostring(qEst)
+    label.new(x, y, msg, style=label.style_label_up, color=color.new(color.orange, 0), textcolor=color.black, size=size.tiny)
+
+f_dbgExitCallLabel(int x, float y, float pos, int id) =>
+    string msg = "dbg:exit call 3s pos=" + str.tostring(pos) + " id=" + str.tostring(id)
+    label.new(x, y, msg, style=label.style_label_down, color=color.new(color.purple, 0), textcolor=color.white, size=size.tiny)
+
+f_dbgExitCallSegLabel(int x, float y, float pos, int id, int sBar) =>
+    string msg = "dbg:exit call 3s(seg) pos=" + str.tostring(pos) + " id=" + str.tostring(id) + " sBar=" + str.tostring(sBar)
+    label.new(x, y, msg, style=label.style_label_down, color=color.new(color.purple, 0), textcolor=color.white, size=size.tiny)
+
+// Display switches
+showFractalArrows = input.bool(true, "Show fractal arrows", group="Display") // 分型箭头显示开关
+showFractalRetractX = input.bool(true, "Show retract X", group="Display") // 分型撤销X显示开关
+penDisplay = input.string("true", "Pen display", options=["off", "live", "true", "both"], group="Display") // 笔显示模式：仅实时笔/仅确认笔/两者/关闭
+
+fractalMode = input.string("Mid-as-edge (mid>=3)", "Fractal mode", options=["Default", "Mid-as-edge (mid>=3)", "No share", "No share + gap1", "Custom"], group="Quick") // 分型模式：控制合成K的共用/间隔/边缘判定等
+allowMidAsEdgeWhenMidMergedGe3 = input.bool(true, "Allow mid-as-edge when mid merged >=3", group="Quick") // mid合并根数>=3时，允许mid作为边缘参与分型
+minLiveBiBars = input.int(4, "Min liveBi bars (synthetic, inclusive)", minval=2, group="Quick") // 顶↔底切换时最小长度门槛
+liveBiLenMode = input.string("synthetic", "liveBi length mode", options=["synthetic", "raw"], group="Quick") // 长度门槛使用合成K数量/原始K数量
+minTrueBiBars = input.int(5, "Min trueBi bars (synthetic, inclusive)", minval=2, group="Quick") // 确认笔最小长度（是否生效由 enableTrueBiMinBars 控制）
+trueBiLenMode = input.string("synthetic", "trueBi length mode", options=["synthetic", "raw"], group="Quick") // trueBi长度计算口径：合成K数量/原始K数量
+enableTrueBiMinBars = input.bool(false, "Enable trueBi min bars filter", group="Quick") // 是否启用 trueBi 最小长度过滤（默认关闭）
+
+allowFractalShareBars = input.bool(true, "Allow fractals to share bars", group="Advanced") // 分型是否允许共用合成K线
+
+allowFractalMidEdgeOverlap = input.bool(false, "Allow fractal mid-edge overlap", group="Advanced") // 允许前一个分型的mid与当前分型的边缘重叠（更激进）
+fractalExtraGap = input.int(0, "Fractal extra gap bars (synthetic)", minval=0, group="Advanced") // 分型额外间隔（合成K）
+fractalMinMidGap = input.int(2, "Fractal min mid gap (synthetic)", minval=1, group="Advanced") // 两个分型mid之间的最小间隔（合成K）
+showFractalDebug = input.bool(false, "Show fractal debug (syn idx)", group="Display") // 分型构成调试：显示 T/B + syn索引 + 合并raw数量（默认关闭）
+showFractalRejectDebug = input.bool(false, "Show fractal reject debug", group="Display") // 分型过滤拒绝原因：rej:gap / rej:share
+showLivePenRejectDebug = input.bool(false, "Show liveBi reject debug", group="Display") // 笔接受拒绝原因：rej:len / rej:pen / rej:pen+len
+showTruePenRejectDebug = input.bool(false, "Show trueBi reject debug", group="Display") // trueBi 最小长度过滤拒绝原因：rej:trueLen
+showZhongshuRejectDebug = input.bool(false, "Show zhongshu reject debug", group="Display") // 中枢断裂原因：zs break（中枢与新段无交集）
+zhongshuRejectPadAtr = input.float(0.6, "Zhongshu reject label pad (ATR)", minval=0.0, step=0.05, group="Display") // 中枢断裂调试标签的距离：ATR倍数
+maxDebugLabels = input.int(60, "Max debug labels per type", minval=0, maxval=500, group="Display") // 每类调试标签最大保留数（0=不保留）
+dbgStrategy = input.bool(false, "Debug strategy orders", group="Debug")
+maxFractalArrowLabels = input.int(260, "Max fractal arrow labels", minval=0, maxval=500, group="Display") // 分型箭头最大保留数（0=不保留）
+maxRetractXLabels = input.int(120, "Max retract X labels", minval=0, maxval=500, group="Display") // 撤回X最大保留数（0=不保留）
+maxPenLines = input.int(150, "Max pen lines (live/true)", minval=0, maxval=500, group="Display") // 笔线显示上限（0=不显示线）
+
+showChanLunSignals = input.bool(true, "Show ChanLun 1/2/3", group="Signals") // 是否显示缠论 1/2/3 买卖点标签
+divergenceMode = input.string("both", "MACD divergence mode", options=["area", "extreme", "both"], group="Signals") // 背驰口径：面积/极值/两者任一
+macdFastLen = input.int(6, "MACD fast", minval=1, group="Signals") // MACD快线参数
+macdSlowLen = input.int(13, "MACD slow", minval=1, group="Signals") // MACD慢线参数
+macdSignalLen = input.int(5, "MACD signal", minval=1, group="Signals") // MACD信号线参数
+signalPadAtr = input.float(0.8, "Signal label pad (ATR)", minval=0.0, step=0.05, group="Signals") // 信号标签与价格的距离：ATR倍数
+maxSignalLabels = input.int(300, "Max signal labels", minval=0, maxval=500, group="Signals") // 信号标签最大数量（0=不保留）
+
+showPotential2B = input.bool(true, "Show P2B", group="Signals")
+showPotential2S = input.bool(true, "Show P2S", group="Signals")
+
+showPotential3B = input.bool(true, "Show P3B", group="Signals")
+showPotential3S = input.bool(true, "Show P3S", group="Signals")
+
+showChanLunRejectDebug = input.bool(false, "Show ChanLun reject debug", group="Signals") // 买卖点拒绝原因调试：在顶/底分型处显示“最可能的潜在买/卖点”被拒绝原因
+chanLunRejectDebugMode = input.string("best", "ChanLun reject debug mode", options=["best", "all"], group="Signals") // 拒绝原因输出模式：best=仅输出最可能的潜在点；all=列出1/2/3的reject
+
+showZhongshu = input.bool(true, "Show zhongshu", group="Display") // 是否显示中枢框
+showZhongshuInit = input.bool(false, "Show zhongshu initial", group="Display") // 是否显示“初始中枢”框（用于观察首次形成的交集范围）
+maxZhongshuHistory = input.int(20, "Max zhongshu history", minval=0, maxval=500, group="Display") // 历史中枢框最大保留数量（0=不保留）
+
+fractalPadAtr = input.float(0.05, "Fractal arrow padding (ATR%)", minval=0.0, step=0.01, group="Display") // 分型箭头与K线间距(ATR百分比)
+fractalPadTicks = input.int(2, "Fractal arrow padding (ticks)", minval=0, group="Display") // 分型箭头与K线间距(最小tick)
+fractalArrowSizeOpt = input.string("tiny", "Fractal arrow size", options=["auto", "tiny", "small", "normal"], group="Display") // 分型箭头大小
+
+fractalArrowSize = fractalArrowSizeOpt == "auto" ? size.auto : fractalArrowSizeOpt == "small" ? size.small : fractalArrowSizeOpt == "normal" ? size.normal : size.tiny
+
+bool effAllowFractalShareBars = allowFractalShareBars
+int effFractalExtraGap = fractalExtraGap
+int effFractalMinMidGap = fractalMinMidGap
+bool effAllowMidAsEdgeWhenMidMergedGe3 = allowMidAsEdgeWhenMidMergedGe3
+
+if fractalMode != "Custom"
+    if fractalMode == "Default"
+        effAllowFractalShareBars := true
+        effFractalExtraGap := 0
+        effFractalMinMidGap := 2
+        effAllowMidAsEdgeWhenMidMergedGe3 := false
+    else if fractalMode == "Mid-as-edge (mid>=3)"
+        effAllowFractalShareBars := true
+        effFractalExtraGap := 0
+        effFractalMinMidGap := 1
+        effAllowMidAsEdgeWhenMidMergedGe3 := true
+    else if fractalMode == "No share"
+        effAllowFractalShareBars := false
+        effFractalExtraGap := 0
+        effFractalMinMidGap := 2
+        effAllowMidAsEdgeWhenMidMergedGe3 := false
+    else
+        effAllowFractalShareBars := false
+        effFractalExtraGap := 1
+        effFractalMinMidGap := 2
+        effAllowMidAsEdgeWhenMidMergedGe3 := false
+
+// Containment / Synthetic bars
+useSyntheticBars = input.bool(true, "Use synthetic bars (containment)", group="Containment") // 是否启用包含处理(合成K线)
+maxSynBars = input.int(50000, "Max synthetic bars kept", minval=1000, maxval=99999, group="Containment")
+var int synBase = 0
+
+var float lastNonContainedHigh = na
+var float lastNonContainedLow = na
+var int lastNonContainedDir = 0  // 1=up, -1=down
+
+var synHigh = array.new_float()
+var synLow = array.new_float()
+var synBarIndex = array.new_int()
+var synRawCount = array.new_int()
+
+f_synCount() => synBase + array.size(synHigh)
+
+f_synInRange(int absIdx) => absIdx >= synBase and absIdx < (synBase + array.size(synHigh))
+f_synRel(int absIdx) => absIdx - synBase
+
+f_synGetHigh(int idx) => f_synInRange(idx) ? array.get(synHigh, f_synRel(idx)) : na
+f_synGetLow(int idx) => f_synInRange(idx) ? array.get(synLow, f_synRel(idx)) : na
+f_synGetBarIndex(int idx) => f_synInRange(idx) ? array.get(synBarIndex, f_synRel(idx)) : na
+f_synGetRawCount(int idx) => f_synInRange(idx) ? array.get(synRawCount, f_synRel(idx)) : na
+
+f_synSet(int idx, float h, float l, int bi) =>
+    if f_synInRange(idx)
+        int ridx = f_synRel(idx)
+        array.set(synHigh, ridx, h)
+        array.set(synLow, ridx, l)
+        array.set(synBarIndex, ridx, bi)
+
+f_synPush(float h, float l, int bi) =>
+    int shifted = 0
+    while array.size(synHigh) >= maxSynBars
+        array.shift(synHigh)
+        array.shift(synLow)
+        array.shift(synBarIndex)
+        array.shift(synRawCount)
+        shifted += 1
+    array.push(synHigh, h)
+    array.push(synLow, l)
+    array.push(synBarIndex, bi)
+    array.push(synRawCount, 1)
+    shifted
+
+f_synIncRawCount(int idx) =>
+    if f_synInRange(idx)
+        int ridx = f_synRel(idx)
+        array.set(synRawCount, ridx, array.get(synRawCount, ridx) + 1)
+
+f_isContain(float h1, float l1, float h2, float l2) =>
+    // returns true if bar1 contains bar2 OR bar2 contains bar1
+    (h1 >= h2 and l1 <= l2) or (h2 >= h1 and l2 <= l1)
+
+f_dirByHighLow(float prevH, float prevL, float curH, float curL) =>
+    curH > prevH ? 1 : curH < prevH ? -1 : curL > prevL ? 1 : curL < prevL ? -1 : 0
+
+f_mergeByDir(float hA, float lA, float hB, float lB, int dir) =>
+    float h = na
+    float l = na
+    if dir >= 0
+        h := math.max(hA, hB)
+        l := math.max(lA, lB)
+    else
+        h := math.min(hA, hB)
+        l := math.min(lA, lB)
+    [h, l]
+
+// Pending fractal for possible retract (containment may update the right bar)
+var bool pendingFractal = false
+var bool pendingIsTop = false
+var int pendingLeftIdx = na
+var int pendingMidIdx = na
+var int pendingRightIdx = na
+var int pendingMidBarIndex = na
+var float pendingY = na
+var int pendingPrevLastFractalRightSynIdx = na
+var int pendingPrevLastFractalMidSynIdx = na
+var int pendingPrevLastFractalMidBarIndex = na
+var label pendingLabelId = na
+
+var label liveFractalPreviewLabel = na
+var line livePenPreviewLine = na
+
+var int lastFractalMidBarIndex = na
+var int lastFractalRightSynIdx = na
+var int lastFractalMidSynIdx = na
+
+var livePivotsBar = array.new_int()
+var livePivotsSynIdx = array.new_int()
+var livePivotsPrice = array.new_float()
+var livePivotsType = array.new_int()
+var liveLines = array.new_line()
+
+var truePivotsBar = array.new_int()
+var truePivotsSynIdx = array.new_int()
+var truePivotsPrice = array.new_float()
+var int lastTrueDir = 0
+var line lastTrueLine = na
+var trueLines = array.new_line()
+
+var bool prevShowLiveBi = false
+var bool prevShowTrueBi = false
+
+var bool hasZhongshu = false
+var float zhongshuHigh = na
+var float zhongshuLow = na
+var int zhongshuStartBar = na
+var int zhongshuEndBar = na
+var box zhongshuBox = na
+var zhongshuHistoryBoxes = array.new_box()
+var box zhongshuInitBox = na
+var zhongshuInitHistoryBoxes = array.new_box()
+var int zhongshuNextStartPivot = 0
+var int zhongshuSeekDir = 0
+
+var int zhongshuEntryStartPivot = na
+var int zhongshuEntryEndPivot = na
+var int zhongshuExitStartPivot = na
+var int zhongshuExitEndPivot = na
+var int zhongshuExitConfirmBar = na
+var int zhongshuIntersectCount = 0
+var float zhongshuLowBeforeLast = na
+var float zhongshuHighBeforeLast = na
+var int zhongshuEndBarBeforeLast = na
+var int zhongshuExitStartPivotBeforeLast = na
+var int zhongshuExitEndPivotBeforeLast = na
+var int zhongshuBreakCount = 0
+var int zhongshuBreakDirCand = 0
+var float zhongshuBreakHighCand = na
+var float zhongshuBreakLowCand = na
+
+var fractalDebugLabels = array.new_label()
+var fractalRejectLabels = array.new_label()
+var penRejectLabels = array.new_label()
+var zhongshuRejectLabels = array.new_label()
+var fractalArrowLabels = array.new_label()
+var retractXLabels = array.new_label()
+var signalLabels = array.new_label()
+var p2bLabels = array.new_label()
+var p2sLabels = array.new_label()
+var p3bLabels = array.new_label()
+var p3sLabels = array.new_label()
+var chanLunRejectLabels = array.new_label()
+
+var float lastDownPrice = na
+var float lastDownArea = na
+var float lastDownExt = na
+var float lastUpPrice = na
+var float lastUpArea = na
+var float lastUpExt = na
+
+var bool awaiting2Buy = false
+var float buy1Low = na
+var int buy1Bar = na
+var label awaiting2BuyP2BLabel = na
+var bool awaiting2Sell = false
+var float sell1High = na
+var int sell1Bar = na
+var label awaiting2SellP2SLabel = na
+
+var bool awaiting3Buy = false
+var bool awaiting3Sell = false
+var bool allowP3B = false
+var bool allowP3S = false
+var float zsBreakHigh = na
+var float zsBreakLow = na
+
+var int awaiting3BuyFirstPivotIdx = na
+var int awaiting3SellFirstPivotIdx = na
+var float awaiting3BuyFirstPivotPrice = na
+var float awaiting3SellFirstPivotPrice = na
+var int awaiting3BuyFirstPivotBar = na
+var int awaiting3SellFirstPivotBar = na
+
+var label awaiting3BuyP3BLabel = na
+var label awaiting3SellP3SLabel = na
+
+var int lastP2BLabelBar = na
+var int lastP2SLabelBar = na
+var int lastP2BRejDbgBar = na
+var int lastP2SRejDbgBar = na
+
+var int lastP3BMissingDbgBar = na
+var int lastP3SMissingDbgBar = na
+
+var int lastP3BStateDbgBar = na
+var int lastP3SStateDbgBar = na
+
+var int lastP3BFractalFiltDbgBar = na
+var int lastP3SFractalFiltDbgBar = na
+
+var int stackUpBar = na
+var int stackUpCount = 0
+var int stackDownBar = na
+var int stackDownCount = 0
+
+var int dbgStackUpBar = na
+var int dbgStackUpCount = 0
+var int dbgStackDownBar = na
+var int dbgStackDownCount = 0
+
+var chanLunAggUpBars = array.new_int()
+var chanLunAggUpLabels = array.new_label()
+var chanLunAggDownBars = array.new_int()
+var chanLunAggDownLabels = array.new_label()
+
+f_chanLunAggClear() =>
+    while array.size(chanLunAggUpLabels) > 0
+        label l0 = array.shift(chanLunAggUpLabels)
+        label.delete(l0)
+    while array.size(chanLunAggUpBars) > 0
+        array.shift(chanLunAggUpBars)
+    while array.size(chanLunAggDownLabels) > 0
+        label l1 = array.shift(chanLunAggDownLabels)
+        label.delete(l1)
+    while array.size(chanLunAggDownBars) > 0
+        array.shift(chanLunAggDownBars)
+
+f_chanLunAggAppend(bool isUp, int bar, string txt) =>
+    int[] bars = isUp ? chanLunAggUpBars : chanLunAggDownBars
+    label[] labs = isUp ? chanLunAggUpLabels : chanLunAggDownLabels
+    int idx = array.indexof(bars, bar)
+    if idx != -1
+        label l = array.get(labs, idx)
+        string prev = label.get_text(l)
+        label.set_text(l, prev == "" ? txt : (prev + "\n" + txt))
+        true
+    else
+        false
+
+f_chanLunAggAdd(bool isUp, int bar, float y, string txt) =>
+    if maxDebugLabels == 0
+        na
+    else
+        label l = label.new(bar, y, txt, style=isUp ? label.style_label_up : label.style_label_down, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+        if isUp
+            array.push(chanLunAggUpBars, bar)
+            array.push(chanLunAggUpLabels, l)
+            while array.size(chanLunAggUpLabels) > maxDebugLabels
+                label old = array.shift(chanLunAggUpLabels)
+                array.shift(chanLunAggUpBars)
+                label.delete(old)
+        else
+            array.push(chanLunAggDownBars, bar)
+            array.push(chanLunAggDownLabels, l)
+            while array.size(chanLunAggDownLabels) > maxDebugLabels
+                label old = array.shift(chanLunAggDownLabels)
+                array.shift(chanLunAggDownBars)
+                label.delete(old)
+        l
+
+f_keepLabel(label[] a, label id) =>
+    if maxDebugLabels == 0
+        label.delete(id)
+    else
+        array.push(a, id)
+        if array.size(a) > maxDebugLabels
+            label old = array.shift(a)
+            label.delete(old)
+
+f_keepLabelN(label[] a, label id, int limit) =>
+    if limit == 0
+        label.delete(id)
+    else
+        array.push(a, id)
+        if array.size(a) > limit
+            label old2 = array.shift(a)
+            label.delete(old2)
+
+f_stackNextUp(int x, float baseY, float step, int lastX, int count) =>
+    int last2 = lastX
+    int cnt2 = count
+    if last2 == x
+        cnt2 += 1
+    else
+        last2 := x
+        cnt2 := 0
+    float y = baseY - step * cnt2
+    [y, last2, cnt2]
+
+f_stackNextDown(int x, float baseY, float step, int lastX, int count) =>
+    int last2 = lastX
+    int cnt2 = count
+    if last2 == x
+        cnt2 += 1
+    else
+        last2 := x
+        cnt2 := 0
+    float y = baseY + step * cnt2
+    [y, last2, cnt2]
+
+f_findTruePivotIdxByBar(int targetBar) =>
+    int n = array.size(truePivotsBar)
+    int res = na
+    for k = 0 to 499
+        int i = n - 1 - k
+        if i < 0
+            break
+        if array.get(truePivotsBar, i) == targetBar
+            res := i
+            break
+    res
+
+[macdLine, macdSigLine, macdHist] = ta.macd(close, macdFastLen, macdSlowLen, macdSignalLen)
+float atr14 = ta.atr(14)
+
+f_macdSegMetrics(int startBar, int endBar, int dir) =>
+    float area = 0.0
+    float ext = na
+    int maxIter = 500
+    for k = 0 to maxIter - 1
+        int bi = endBar - k
+        if bi < startBar
+            break
+        int off = bar_index - bi
+        if off >= 0
+            float h = macdHist[off]
+            if dir == 1
+                float hp = math.max(h, 0)
+                area += hp
+                ext := na(ext) ? hp : math.max(ext, hp)
+            else
+                float hn = math.min(h, 0)
+                area += -hn
+                ext := na(ext) ? hn : math.min(ext, hn)
+    [area, ext]
+
+[_macdAreaDummy, _macdExtDummy] = f_macdSegMetrics(bar_index, bar_index, 1)
+
+f_calcFractalOnSyn(int leftIdx, int midIdx, int rightIdx) =>
+    float lh = f_synGetHigh(leftIdx)
+    float ll = f_synGetLow(leftIdx)
+    float mh = f_synGetHigh(midIdx)
+    float ml = f_synGetLow(midIdx)
+    float rh = f_synGetHigh(rightIdx)
+    float rl = f_synGetLow(rightIdx)
+
+    bool isTopF = mh > lh and mh > rh
+    bool isBotF = ml < ll and ml < rl
+    [isTopF, isBotF, mh, ml]
+
+f_markRetractX(int bi, float y) =>
+    if showFractalRetractX
+        label lx = label.new(bi, y, "", style=label.style_xcross, color=color.new(color.gray, 80), textcolor=color.new(color.gray, 80), size=size.tiny)
+        f_keepLabelN(retractXLabels, lx, maxRetractXLabels)
+
+// Build synthetic bars (containment)
+var bool synAppended = false
+var bool synUpdated = false
+
+synAppended := false
+synUpdated := false
+
+bool liveCommit = barstate.isconfirmed or not barstate.isrealtime
+
+if barstate.isfirst
+    float h0 = high
+    float l0 = low
+    synBase += f_synPush(h0, l0, bar_index)
+    lastNonContainedHigh := h0
+    lastNonContainedLow := l0
+    lastNonContainedDir := 0
+else
+    float h = high
+    float l = low
+
+    if not useSyntheticBars
+        // treat every raw bar as a synthetic bar
+        synBase += f_synPush(h, l, bar_index)
+        synAppended := true
+        int sc = f_synCount()
+        if sc >= 2
+            float ph = f_synGetHigh(sc - 2)
+            float pl = f_synGetLow(sc - 2)
+            lastNonContainedDir := f_dirByHighLow(ph, pl, h, l)
+    else
+        int sc0 = f_synCount()
+        float lastH = f_synGetHigh(sc0 - 1)
+        float lastL = f_synGetLow(sc0 - 1)
+
+        bool contain = f_isContain(lastH, lastL, h, l)
+
+        if contain
+            int dir = lastNonContainedDir
+            if dir == 0
+                if not na(lastNonContainedHigh)
+                    dir := f_dirByHighLow(lastNonContainedHigh, lastNonContainedLow, lastH, lastL)
+                if dir == 0
+                    dir := f_dirByHighLow(lastH, lastL, h, l)
+
+            [mhMerge, mlMerge] = f_mergeByDir(lastH, lastL, h, l, dir)
+            f_synSet(sc0 - 1, mhMerge, mlMerge, bar_index)
+            f_synIncRawCount(sc0 - 1)
+            synUpdated := true
+        else
+            // append new synthetic bar
+            synBase += f_synPush(h, l, bar_index)
+            synAppended := true
+
+            int sc1 = f_synCount()
+            if sc1 >= 2
+                float ph = f_synGetHigh(sc1 - 2)
+                float pl = f_synGetLow(sc1 - 2)
+                lastNonContainedDir := f_dirByHighLow(ph, pl, h, l)
+                lastNonContainedHigh := ph
+                lastNonContainedLow := pl
+
+// If a new synthetic bar is appended, the previous right bar is now fixed; stop retract-checking
+if liveCommit and synAppended and pendingFractal
+    pendingFractal := false
+
+// If the last synthetic bar updated due to containment and we have a pending fractal, re-check validity
+if liveCommit and synUpdated and pendingFractal
+    // rightIdx is always the last synthetic index at the time; re-check with updated right bar
+    int scNow = f_synCount()
+    int rightIdxNow = scNow - 1
+
+    if pendingRightIdx == rightIdxNow
+        [isTopNow, isBotNow, mhNow, mlNow] = f_calcFractalOnSyn(pendingLeftIdx, pendingMidIdx, pendingRightIdx)
+        bool stillValid = pendingIsTop ? isTopNow : isBotNow
+        if not stillValid
+            f_markRetractX(pendingMidBarIndex, pendingY)
+            lastFractalRightSynIdx := pendingPrevLastFractalRightSynIdx
+            lastFractalMidSynIdx := pendingPrevLastFractalMidSynIdx
+            lastFractalMidBarIndex := pendingPrevLastFractalMidBarIndex
+            pendingFractal := false
+
+// Zhongshu display toggle: when off, delete active + historical boxes immediately
+if not showZhongshu
+    if not na(zhongshuBox)
+        box.delete(zhongshuBox)
+    if not na(zhongshuInitBox)
+        box.delete(zhongshuInitBox)
+    while array.size(zhongshuHistoryBoxes) > 0
+        box oldBoxOff = array.shift(zhongshuHistoryBoxes)
+        box.delete(oldBoxOff)
+    while array.size(zhongshuInitHistoryBoxes) > 0
+        box oldInitOff = array.shift(zhongshuInitHistoryBoxes)
+        box.delete(oldInitOff)
+    hasZhongshu := false
+    zhongshuBox := na
+    zhongshuInitBox := na
+
+if showZhongshu and not showZhongshuInit
+    if not na(zhongshuInitBox)
+        box.delete(zhongshuInitBox)
+        zhongshuInitBox := na
+    while array.size(zhongshuInitHistoryBoxes) > 0
+        box oldInitOff2 = array.shift(zhongshuInitHistoryBoxes)
+        box.delete(oldInitOff2)
+
+if not showChanLunSignals
+    while array.size(signalLabels) > 0
+        label s0 = array.shift(signalLabels)
+        label.delete(s0)
+
+if not showChanLunSignals or not showPotential2B
+    while array.size(p2bLabels) > 0
+        label p2b0 = array.shift(p2bLabels)
+        label.delete(p2b0)
+    awaiting2BuyP2BLabel := na
+
+    lastP2BLabelBar := na
+    lastP2BRejDbgBar := na
+
+if not showChanLunSignals or not showPotential2S
+    while array.size(p2sLabels) > 0
+        label p2s0 = array.shift(p2sLabels)
+        label.delete(p2s0)
+    awaiting2SellP2SLabel := na
+
+    lastP2SLabelBar := na
+    lastP2SRejDbgBar := na
+
+if not showChanLunSignals or not showPotential3B
+    while array.size(p3bLabels) > 0
+        label p0 = array.shift(p3bLabels)
+        label.delete(p0)
+
+if not showChanLunSignals or not showPotential3S
+    while array.size(p3sLabels) > 0
+        label p1 = array.shift(p3sLabels)
+        label.delete(p1)
+
+if not showZhongshuRejectDebug
+    while array.size(zhongshuRejectLabels) > 0
+        label z0 = array.shift(zhongshuRejectLabels)
+        label.delete(z0)
+
+if not showChanLunRejectDebug
+    while array.size(chanLunRejectLabels) > 0
+        label r0 = array.shift(chanLunRejectLabels)
+        label.delete(r0)
+    f_chanLunAggClear()
+    lastP2BRejDbgBar := na
+    lastP2SRejDbgBar := na
+
+
+if not showChanLunSignals and not showChanLunRejectDebug
+    awaiting2Buy := false
+    buy1Low := na
+    buy1Bar := na
+    awaiting2BuyP2BLabel := na
+    awaiting2Sell := false
+    sell1High := na
+    sell1Bar := na
+    awaiting2SellP2SLabel := na
+    lastP2BLabelBar := na
+    lastP2SLabelBar := na
+    lastP2BRejDbgBar := na
+    lastP2SRejDbgBar := na
+    awaiting3Buy := false
+    awaiting3Sell := false
+    allowP3B := false
+    allowP3S := false
+    zsBreakHigh := na
+    zsBreakLow := na
+
+    awaiting3BuyFirstPivotIdx := na
+    awaiting3SellFirstPivotIdx := na
+    awaiting3BuyFirstPivotPrice := na
+    awaiting3SellFirstPivotPrice := na
+    awaiting3BuyFirstPivotBar := na
+    awaiting3SellFirstPivotBar := na
+    awaiting3BuyP3BLabel := na
+    awaiting3SellP3SLabel := na
+
+bool curShowLiveBi = (penDisplay == "live" or penDisplay == "both")
+bool curShowTrueBi = (penDisplay == "true" or penDisplay == "both")
+
+if liveCommit and not na(liveFractalPreviewLabel)
+    label.delete(liveFractalPreviewLabel)
+    liveFractalPreviewLabel := na
+
+if liveCommit and not na(livePenPreviewLine)
+    line.delete(livePenPreviewLine)
+    livePenPreviewLine := na
+
+if not showFractalArrows and not na(liveFractalPreviewLabel)
+    label.delete(liveFractalPreviewLabel)
+    liveFractalPreviewLabel := na
+
+if not curShowLiveBi and not na(livePenPreviewLine)
+    line.delete(livePenPreviewLine)
+    livePenPreviewLine := na
+
+if curShowLiveBi != prevShowLiveBi
+    while array.size(liveLines) > 0
+        line l0 = array.shift(liveLines)
+        line.delete(l0)
+    if curShowLiveBi
+        int nL = array.size(livePivotsBar)
+        if nL >= 2
+            int startL = maxPenLines == 0 ? nL : math.max(1, nL - maxPenLines)
+            for i = startL to nL - 1
+                int pbL = array.get(livePivotsBar, i - 1)
+                float ppL = array.get(livePivotsPrice, i - 1)
+                int ptL = array.get(livePivotsType, i - 1)
+                int nbL = array.get(livePivotsBar, i)
+                float npL = array.get(livePivotsPrice, i)
+                int ntL = array.get(livePivotsType, i)
+                int dirL = (ptL == ntL) ? (ntL == 1 ? 1 : -1) : (ptL == -1 ? 1 : -1)
+                array.push(liveLines, line.new(pbL, ppL, nbL, npL, color=color.black, width=1))
+    prevShowLiveBi := curShowLiveBi
+
+if curShowTrueBi != prevShowTrueBi
+    while array.size(trueLines) > 0
+        line t0 = array.shift(trueLines)
+        line.delete(t0)
+    lastTrueLine := na
+    if curShowTrueBi
+        int nT = array.size(truePivotsBar)
+        if nT >= 2
+            int startT = maxPenLines == 0 ? nT : math.max(1, nT - maxPenLines)
+            for i = startT to nT - 1
+                int pbT = array.get(truePivotsBar, i - 1)
+                float ppT = array.get(truePivotsPrice, i - 1)
+                int nbT = array.get(truePivotsBar, i)
+                float npT = array.get(truePivotsPrice, i)
+                int dirT = npT > ppT ? 1 : npT < ppT ? -1 : 0
+                color cT = dirT == 1 ? color.rgb(255, 165, 0) : color.rgb(30, 144, 255)
+                line lnT = line.new(pbT, ppT, nbT, npT, color=cT, width=2)
+                array.push(trueLines, lnT)
+                lastTrueLine := lnT
+    prevShowTrueBi := curShowTrueBi
+
+// Detect new fractal candidate when a new synthetic bar is appended OR updated by containment
+if synAppended or synUpdated
+    int sc = f_synCount()
+    if sc >= 3
+        int leftIdx = sc - 3
+        int midIdx = sc - 2
+        int rightIdx = sc - 1
+
+        [isTop, isBot, mhFr, mlFr] = f_calcFractalOnSyn(leftIdx, midIdx, rightIdx)
+
+        if not (isTop or isBot)
+            if not liveCommit and not na(liveFractalPreviewLabel)
+                label.delete(liveFractalPreviewLabel)
+                liveFractalPreviewLabel := na
+            if not liveCommit and not na(livePenPreviewLine)
+                line.delete(livePenPreviewLine)
+                livePenPreviewLine := na
+
+        if isTop or isBot
+            int biMid = f_synGetBarIndex(midIdx)
+            int offMid = bar_index - biMid
+            float padAtr = atr14 * fractalPadAtr
+            float padTick = syminfo.mintick * fractalPadTicks
+            float pad = math.max(padAtr, padTick)
+            float yAtBar = offMid >= 0 ? (isTop ? (high[offMid] + pad) : (low[offMid] - pad)) : na
+            float y = na(yAtBar) ? (isTop ? mhFr : mlFr) : yAtBar
+            float pivotRaw = offMid >= 0 ? (isTop ? high[offMid] : low[offMid]) : (isTop ? mhFr : mlFr)
+            float rawH = offMid >= 0 ? high[offMid] : mhFr
+            float rawL = offMid >= 0 ? low[offMid] : mlFr
+
+            bool passGap = na(lastFractalMidSynIdx) or (midIdx - lastFractalMidSynIdx >= effFractalMinMidGap)
+            int fractalMinLeftDelta = (effAllowFractalShareBars ? 0 : 1) + effFractalExtraGap
+            bool allowMidAsEdge = false
+            int prevMidMerged = na
+            int midRawCnt = f_synGetRawCount(midIdx)
+            if effAllowFractalShareBars and effFractalExtraGap == 0 and not na(lastFractalMidSynIdx) and leftIdx == lastFractalMidSynIdx
+                prevMidMerged := f_synGetRawCount(lastFractalMidSynIdx)
+                allowMidAsEdge := (allowFractalMidEdgeOverlap or effAllowMidAsEdgeWhenMidMergedGe3) and (prevMidMerged >= 3 or midRawCnt >= 3)
+            bool passNoShare = na(lastFractalRightSynIdx) or (leftIdx - lastFractalRightSynIdx >= fractalMinLeftDelta) or allowMidAsEdge
+
+            if liveCommit and showFractalRejectDebug and (not passGap or not passNoShare)
+                float rejY = isTop ? (y + pad * 0.35) : (y - pad * 0.35)
+                string rejReason = (not passGap and not passNoShare) ? "rej:gap+share" : (not passGap ? "rej:gap" : "rej:share")
+                label lr = label.new(biMid, rejY, rejReason, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                f_keepLabel(fractalRejectLabels, lr)
+
+            if liveCommit and showChanLunRejectDebug and (not passGap or not passNoShare)
+                float p3PivotPriceF = isTop ? f_synGetHigh(midIdx) : f_synGetLow(midIdx)
+                int p3PivotTypeF = isTop ? 1 : -1
+                string rejFS = (not passGap and not passNoShare) ? ":gap+share" : (not passGap ? ":gap" : ":share")
+                if p3PivotTypeF == -1 and awaiting2Buy and not na(buy1Low) and not na(buy1Bar) and biMid > buy1Bar and (na(lastP2BRejDbgBar) or lastP2BRejDbgBar != biMid)
+                    float yrejP2BF = p3PivotPriceF - pad - atr14 * zhongshuRejectPadAtr
+                    string outP2BF = "rej:p2b:fractal" + rejFS + " 1low=" + str.tostring(buy1Low)
+                    bool mergedP2BF = f_chanLunAggAppend(true, biMid, outP2BF)
+                    if not mergedP2BF
+                        float stepDbgP2BF = atr14 * signalPadAtr * 0.8
+                        if dbgStackUpBar == biMid
+                            dbgStackUpCount += 1
+                        else
+                            dbgStackUpBar := biMid
+                            dbgStackUpCount := 0
+                        yrejP2BF := yrejP2BF - stepDbgP2BF * dbgStackUpCount
+                        f_chanLunAggAdd(true, biMid, yrejP2BF, outP2BF)
+                    lastP2BRejDbgBar := biMid
+                if p3PivotTypeF == 1 and awaiting2Sell and not na(sell1High) and not na(sell1Bar) and biMid > sell1Bar and (na(lastP2SRejDbgBar) or lastP2SRejDbgBar != biMid)
+                    float yrejP2SF = p3PivotPriceF + pad + atr14 * zhongshuRejectPadAtr
+                    string outP2SF = "rej:p2s:fractal" + rejFS + " 1high=" + str.tostring(sell1High)
+                    bool mergedP2SF = f_chanLunAggAppend(false, biMid, outP2SF)
+                    if not mergedP2SF
+                        float stepDbgP2SF = atr14 * signalPadAtr * 0.8
+                        if dbgStackDownBar == biMid
+                            dbgStackDownCount += 1
+                        else
+                            dbgStackDownBar := biMid
+                            dbgStackDownCount := 0
+                        yrejP2SF := yrejP2SF + stepDbgP2SF * dbgStackDownCount
+                        f_chanLunAggAdd(false, biMid, yrejP2SF, outP2SF)
+                    lastP2SRejDbgBar := biMid
+
+                if p3PivotTypeF == -1 and not na(zsBreakHigh) and (na(lastP3BFractalFiltDbgBar) or lastP3BFractalFiltDbgBar != biMid)
+                    float yrejFB = p3PivotPriceF - pad - atr14 * zhongshuRejectPadAtr
+                    string outFB = "rej:p3b:fractal" + rejFS + " await=" + str.tostring(awaiting3Buy) + " allow=" + str.tostring(allowP3B) + " bh=" + str.tostring(zsBreakHigh)
+                    label lfb = label.new(biMid, yrejFB, outFB, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                    f_keepLabelN(chanLunRejectLabels, lfb, maxDebugLabels)
+                    lastP3BFractalFiltDbgBar := biMid
+                if p3PivotTypeF == 1 and not na(zsBreakLow) and (na(lastP3SFractalFiltDbgBar) or lastP3SFractalFiltDbgBar != biMid)
+                    float yrejFS = p3PivotPriceF + pad + atr14 * zhongshuRejectPadAtr
+                    string outFS = "rej:p3s:fractal" + rejFS + " await=" + str.tostring(awaiting3Sell) + " allow=" + str.tostring(allowP3S) + " bl=" + str.tostring(zsBreakLow)
+                    label lfs = label.new(biMid, yrejFS, outFS, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                    f_keepLabelN(chanLunRejectLabels, lfs, maxDebugLabels)
+                    lastP3SFractalFiltDbgBar := biMid
+
+            if not liveCommit and (not passGap or not passNoShare)
+                if not na(liveFractalPreviewLabel)
+                    label.delete(liveFractalPreviewLabel)
+                    liveFractalPreviewLabel := na
+                if not na(livePenPreviewLine)
+                    line.delete(livePenPreviewLine)
+                    livePenPreviewLine := na
+
+            if passGap and passNoShare
+                if showFractalArrows
+                    if liveCommit
+                        label la = label.new(biMid, y, "", style=isTop ? label.style_triangledown : label.style_triangleup, color=isTop ? color.rgb(140, 199, 140) : color.rgb(255, 182, 193), textcolor=color.black, size=fractalArrowSize)
+                        f_keepLabelN(fractalArrowLabels, la, maxFractalArrowLabels)
+                    else
+                        color cPrev = color.new(isTop ? color.rgb(140, 199, 140) : color.rgb(255, 182, 193), 70)
+                        if na(liveFractalPreviewLabel)
+                            liveFractalPreviewLabel := label.new(biMid, y, "", style=isTop ? label.style_triangledown : label.style_triangleup, color=cPrev, textcolor=color.black, size=fractalArrowSize)
+                        else
+                            label.set_x(liveFractalPreviewLabel, biMid)
+                            label.set_y(liveFractalPreviewLabel, y)
+                            label.set_style(liveFractalPreviewLabel, isTop ? label.style_triangledown : label.style_triangleup)
+                            label.set_color(liveFractalPreviewLabel, cPrev)
+                            label.set_textcolor(liveFractalPreviewLabel, color.black)
+                else
+                    if not liveCommit and not na(liveFractalPreviewLabel)
+                        label.delete(liveFractalPreviewLabel)
+                        liveFractalPreviewLabel := na
+
+                if liveCommit and showFractalDebug
+                    float dbgY = isTop ? (y + pad * 0.5) : (y - pad * 0.5)
+                    string dbgText = (isTop ? "T" : "B") + " [" + str.tostring(leftIdx) + "," + str.tostring(midIdx) + "," + str.tostring(rightIdx) + "]" + " raw=" + str.tostring(midRawCnt)
+                    dbgText := not na(prevMidMerged) ? (dbgText + " prevMidRaw=" + str.tostring(prevMidMerged)) : dbgText
+                    dbgText := dbgText + " syn=[" + str.tostring(mlFr) + "," + str.tostring(mhFr) + "]" + " raw=[" + str.tostring(rawL) + "," + str.tostring(rawH) + "]"
+                    label ld = label.new(biMid, dbgY, dbgText, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                    f_keepLabel(fractalDebugLabels, ld)
+
+                float penPivotPrice = isTop ? f_synGetHigh(midIdx) : f_synGetLow(midIdx)
+                int penPivotType = isTop ? 1 : -1
+                int liveN = array.size(livePivotsBar)
+                if liveN == 0
+                    if liveCommit
+                        array.push(livePivotsBar, biMid)
+                        array.push(livePivotsSynIdx, midIdx)
+                        array.push(livePivotsPrice, penPivotPrice)
+                        array.push(livePivotsType, penPivotType)
+                        if array.size(truePivotsBar) == 0
+                            array.push(truePivotsBar, biMid)
+                            array.push(truePivotsSynIdx, midIdx)
+                            array.push(truePivotsPrice, penPivotPrice)
+                            lastTrueDir := 0
+                else
+                    int prevType = array.get(livePivotsType, liveN - 1)
+                    int prevSynIdx = array.get(livePivotsSynIdx, liveN - 1)
+                    int prevBar = array.get(livePivotsBar, liveN - 1)
+                    float prevPrice = array.get(livePivotsPrice, liveN - 1)
+                    int lenSyn = (midIdx - prevSynIdx + 1)
+                    int lenRaw = (biMid - prevBar + 1)
+                    int lenUse = (liveBiLenMode == "raw") ? lenRaw : lenSyn
+                    bool lenOk = (penPivotType == prevType) ? true : (lenUse >= minLiveBiBars)
+                    bool acceptLive = false
+                    if prevType == 1
+                        acceptLive := (penPivotType == -1) or (penPivotType == 1 and penPivotPrice > prevPrice)
+                    else
+                        acceptLive := (penPivotType == 1) or (penPivotType == -1 and penPivotPrice < prevPrice)
+
+                    if liveCommit
+                        float sigPadP2 = atr14 * signalPadAtr
+                        if penPivotType == -1 and awaiting2Buy and not na(buy1Low) and not na(buy1Bar) and biMid > buy1Bar
+                            bool fromTop2B = prevType == 1
+                            bool lenPass2B = fromTop2B and lenOk
+                            bool okP2B = lenPass2B and (penPivotPrice > buy1Low)
+                            if showChanLunSignals and showPotential2B and okP2B and (na(lastP2BLabelBar) or lastP2BLabelBar != biMid)
+                                float yP2B = penPivotPrice - sigPadP2
+                                float stepSigP2B = sigPadP2 * 0.8
+                                if stackUpBar == biMid
+                                    stackUpCount += 1
+                                else
+                                    stackUpBar := biMid
+                                    stackUpCount := 0
+                                yP2B := yP2B - stepSigP2B * stackUpCount
+                                label lp2b = label.new(biMid, yP2B, "P2B", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                awaiting2BuyP2BLabel := lp2b
+                                f_keepLabelN(p2bLabels, lp2b, maxSignalLabels)
+                                lastP2BLabelBar := biMid
+                            else if showChanLunRejectDebug and (na(lastP2BRejDbgBar) or lastP2BRejDbgBar != biMid)
+                                float yrejP2B = penPivotPrice - pad - atr14 * zhongshuRejectPadAtr
+                                string outP2B = "rej:p2b"
+                                outP2B := outP2B + (not showChanLunSignals ? ":sigOff" : (not showPotential2B ? ":p2Off" : (not fromTop2B ? ":notFromTop" : (not lenOk ? ":len" : (not (penPivotPrice >= buy1Low) ? ":<1low" : ":dup")))))
+                                outP2B := outP2B + " use=" + liveBiLenMode + " syn=" + str.tostring(lenSyn) + " raw=" + str.tostring(lenRaw) + " min=" + str.tostring(minLiveBiBars)
+                                outP2B := outP2B + " 1low=" + str.tostring(buy1Low)
+                                bool mergedP2B = f_chanLunAggAppend(true, biMid, outP2B)
+                                if not mergedP2B
+                                    float stepDbgP2B = atr14 * signalPadAtr * 0.8
+                                    if dbgStackUpBar == biMid
+                                        dbgStackUpCount += 1
+                                    else
+                                        dbgStackUpBar := biMid
+                                        dbgStackUpCount := 0
+                                    yrejP2B := yrejP2B - stepDbgP2B * dbgStackUpCount
+                                    f_chanLunAggAdd(true, biMid, yrejP2B, outP2B)
+                                lastP2BRejDbgBar := biMid
+                        if penPivotType == 1 and awaiting2Sell and not na(sell1High) and not na(sell1Bar) and biMid > sell1Bar
+                            bool fromBot2S = prevType == -1
+                            bool lenPass2S = fromBot2S and lenOk
+                            bool okP2S = lenPass2S and (penPivotPrice <= sell1High)
+                            if showChanLunSignals and showPotential2S and okP2S and (na(lastP2SLabelBar) or lastP2SLabelBar != biMid)
+                                float yP2S = penPivotPrice + sigPadP2
+                                float stepSigP2S = sigPadP2 * 0.8
+                                if stackDownBar == biMid
+                                    stackDownCount += 1
+                                else
+                                    stackDownBar := biMid
+                                    stackDownCount := 0
+                                yP2S := yP2S + stepSigP2S * stackDownCount
+                                label lp2s = label.new(biMid, yP2S, "P2S", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                awaiting2SellP2SLabel := lp2s
+                                f_keepLabelN(p2sLabels, lp2s, maxSignalLabels)
+                                lastP2SLabelBar := biMid
+                            else if showChanLunRejectDebug and (na(lastP2SRejDbgBar) or lastP2SRejDbgBar != biMid)
+                                float yrejP2S = penPivotPrice + pad + atr14 * zhongshuRejectPadAtr
+                                string outP2S = "rej:p2s"
+                                outP2S := outP2S + (not showChanLunSignals ? ":sigOff" : (not showPotential2S ? ":p2Off" : (not fromBot2S ? ":notFromBot" : (not lenOk ? ":len" : (not (penPivotPrice <= sell1High) ? ":>1high" : ":dup")))))
+                                outP2S := outP2S + " use=" + liveBiLenMode + " syn=" + str.tostring(lenSyn) + " raw=" + str.tostring(lenRaw) + " min=" + str.tostring(minLiveBiBars)
+                                outP2S := outP2S + " 1high=" + str.tostring(sell1High)
+                                bool mergedP2S = f_chanLunAggAppend(false, biMid, outP2S)
+                                if not mergedP2S
+                                    float stepDbgP2S = atr14 * signalPadAtr * 0.8
+                                    if dbgStackDownBar == biMid
+                                        dbgStackDownCount += 1
+                                    else
+                                        dbgStackDownBar := biMid
+                                        dbgStackDownCount := 0
+                                    yrejP2S := yrejP2S + stepDbgP2S * dbgStackDownCount
+                                    f_chanLunAggAdd(false, biMid, yrejP2S, outP2S)
+                                lastP2SRejDbgBar := biMid
+
+                    if liveCommit and showChanLunRejectDebug
+                        if (penPivotType == -1) and (not awaiting3Buy) and not na(zsBreakHigh) and (na(lastP3BStateDbgBar) or lastP3BStateDbgBar != biMid)
+                            float yrejNA_B0 = penPivotPrice - pad - atr14 * zhongshuRejectPadAtr
+                            string naWhyB0 = (not acceptLive and not lenOk) ? ":pen+len" : (not acceptLive ? ":pen" : (not lenOk ? ":len" : ""))
+                            string outNA_B0 = "rej:p3b:notAwait" + naWhyB0 + " allow=" + str.tostring(allowP3B) + " bh=" + str.tostring(zsBreakHigh)
+                            label lnaB0 = label.new(biMid, yrejNA_B0, outNA_B0, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                            f_keepLabelN(chanLunRejectLabels, lnaB0, maxDebugLabels)
+                            lastP3BStateDbgBar := biMid
+                        if (penPivotType == 1) and (not awaiting3Sell) and not na(zsBreakLow) and (na(lastP3SStateDbgBar) or lastP3SStateDbgBar != biMid)
+                            float yrejNA_S0 = penPivotPrice + pad + atr14 * zhongshuRejectPadAtr
+                            string naWhyS0 = (not acceptLive and not lenOk) ? ":pen+len" : (not acceptLive ? ":pen" : (not lenOk ? ":len" : ""))
+                            string outNA_S0 = "rej:p3s:notAwait" + naWhyS0 + " allow=" + str.tostring(allowP3S) + " bl=" + str.tostring(zsBreakLow)
+                            label lnaS0 = label.new(biMid, yrejNA_S0, outNA_S0, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                            f_keepLabelN(chanLunRejectLabels, lnaS0, maxDebugLabels)
+                            lastP3SStateDbgBar := biMid
+
+                    if liveCommit and showLivePenRejectDebug and (not (acceptLive and lenOk))
+                        float rejY2 = isTop ? (y + pad * 0.35) : (y - pad * 0.35)
+                        string rejPen = (not acceptLive and not lenOk) ? "rej:pen+len" : (not acceptLive ? "rej:pen" : "rej:len")
+                        rejPen := rejPen + " use=" + liveBiLenMode + " syn=" + str.tostring(lenSyn) + " raw=" + str.tostring(lenRaw)
+                        rejPen := rejPen + " prev=" + str.tostring(prevPrice) + " cur=" + str.tostring(penPivotPrice)
+                        label lp = label.new(biMid, rejY2, rejPen, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                        f_keepLabel(penRejectLabels, lp)
+
+                    bool candP3BRej = awaiting3Buy and not na(zsBreakHigh) and (penPivotType == -1)
+                    bool candP3SRej = awaiting3Sell and not na(zsBreakLow) and (penPivotType == 1)
+                    if liveCommit and showChanLunRejectDebug and (candP3BRej or candP3SRej) and (not (acceptLive and lenOk))
+                        float yrejP3 = candP3BRej ? (penPivotPrice - pad - atr14 * zhongshuRejectPadAtr) : (penPivotPrice + pad + atr14 * zhongshuRejectPadAtr)
+                        string outP3 = candP3BRej ? "rej:p3b" : "rej:p3s"
+                        outP3 := outP3 + (not allowP3B and candP3BRej ? ":allow" : not allowP3S and candP3SRej ? ":allow" : not acceptLive and not lenOk ? ":pen+len" : not acceptLive ? ":pen" : ":len")
+                        outP3 := outP3 + " use=" + liveBiLenMode + " syn=" + str.tostring(lenSyn) + " raw=" + str.tostring(lenRaw) + " min=" + str.tostring(minLiveBiBars)
+                        label lrejP3 = label.new(biMid, yrejP3, outP3, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                        f_keepLabelN(chanLunRejectLabels, lrejP3, maxDebugLabels)
+
+                    if not liveCommit
+                        if curShowLiveBi and acceptLive and lenOk
+                            color cPrevLine = color.new(color.black, 70)
+                            if na(livePenPreviewLine)
+                                livePenPreviewLine := line.new(prevBar, prevPrice, biMid, penPivotPrice, color=cPrevLine, width=1)
+                            else
+                                line.set_xy1(livePenPreviewLine, prevBar, prevPrice)
+                                line.set_xy2(livePenPreviewLine, biMid, penPivotPrice)
+                                line.set_color(livePenPreviewLine, cPrevLine)
+                                line.set_width(livePenPreviewLine, 1)
+                        else
+                            if not na(livePenPreviewLine)
+                                line.delete(livePenPreviewLine)
+                                livePenPreviewLine := na
+
+                    if liveCommit and acceptLive and lenOk
+                        int trueBefore = array.size(truePivotsPrice)
+                        bool isExtend = (penPivotType == prevType)
+                        if isExtend
+                            array.push(livePivotsBar, biMid)
+                            array.push(livePivotsSynIdx, midIdx)
+                            array.push(livePivotsPrice, penPivotPrice)
+                            array.push(livePivotsType, penPivotType)
+
+                            int dirLExt = (penPivotType == 1 ? 1 : -1)
+                            if curShowLiveBi and maxPenLines > 0
+                                array.push(liveLines, line.new(prevBar, prevPrice, biMid, penPivotPrice, color=color.black, width=1))
+                                if maxPenLines == 0
+                                    line oldLiveExt = array.shift(liveLines)
+                                    line.delete(oldLiveExt)
+                                else if array.size(liveLines) > maxPenLines
+                                    line oldLiveExt = array.shift(liveLines)
+                                    line.delete(oldLiveExt)
+
+                            int trueN2 = array.size(truePivotsBar)
+                            if trueN2 > 0
+                                array.set(truePivotsBar, trueN2 - 1, biMid)
+                                array.set(truePivotsSynIdx, trueN2 - 1, midIdx)
+                                array.set(truePivotsPrice, trueN2 - 1, penPivotPrice)
+                                if curShowTrueBi and not na(lastTrueLine)
+                                    line.set_xy2(lastTrueLine, biMid, penPivotPrice)
+                        else
+                            array.push(livePivotsBar, biMid)
+                            array.push(livePivotsSynIdx, midIdx)
+                            array.push(livePivotsPrice, penPivotPrice)
+                            array.push(livePivotsType, penPivotType)
+
+                            int dirL = (prevType == -1 ? 1 : -1)
+                            if curShowLiveBi and maxPenLines > 0
+                                array.push(liveLines, line.new(prevBar, prevPrice, biMid, penPivotPrice, color=color.black, width=1))
+                                if maxPenLines == 0
+                                    line oldLive = array.shift(liveLines)
+                                    line.delete(oldLive)
+                                else if array.size(liveLines) > maxPenLines
+                                    line oldLive = array.shift(liveLines)
+                                    line.delete(oldLive)
+
+                            int trueN = array.size(truePivotsBar)
+                            if trueN == 0
+                                array.push(truePivotsBar, prevBar)
+                                array.push(truePivotsSynIdx, prevSynIdx)
+                                array.push(truePivotsPrice, prevPrice)
+                                lastTrueDir := 0
+                                trueN := 1
+
+                            if trueN == 1
+                                int lastBarT0 = array.get(truePivotsBar, 0)
+                                int lastSynT0 = array.get(truePivotsSynIdx, 0)
+                                int lenSynT0 = (midIdx - lastSynT0 + 1)
+                                int lenRawT0 = (biMid - lastBarT0 + 1)
+                                int lenUseT0 = (trueBiLenMode == "raw") ? lenRawT0 : lenSynT0
+                                bool lenOkT0 = (not enableTrueBiMinBars) or (lenUseT0 >= minTrueBiBars)
+                                if lenOkT0
+                                    array.push(truePivotsBar, biMid)
+                                    array.push(truePivotsSynIdx, midIdx)
+                                    array.push(truePivotsPrice, penPivotPrice)
+                                    lastTrueDir := dirL
+                                    if curShowTrueBi and maxPenLines > 0
+                                        color cT1 = dirL == 1 ? color.rgb(255, 165, 0) : color.rgb(30, 144, 255)
+                                        lastTrueLine := line.new(prevBar, prevPrice, biMid, penPivotPrice, color=cT1, width=2)
+                                        array.push(trueLines, lastTrueLine)
+                                        if maxPenLines == 0
+                                            line oldTrue1 = array.shift(trueLines)
+                                            line.delete(oldTrue1)
+                                        else if array.size(trueLines) > maxPenLines
+                                            line oldTrue1 = array.shift(trueLines)
+                                            line.delete(oldTrue1)
+                                else
+                                    if enableTrueBiMinBars and showTruePenRejectDebug
+                                        float rejYT0 = isTop ? (y + pad * 0.8) : (y - pad * 0.8)
+                                        string rejT0 = "rej:trueLen" + " use=" + trueBiLenMode + " syn=" + str.tostring(lenSynT0) + " raw=" + str.tostring(lenRawT0) + " min=" + str.tostring(minTrueBiBars)
+                                        label lpt0 = label.new(biMid, rejYT0, rejT0, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                                        f_keepLabel(penRejectLabels, lpt0)
+                            else
+                                if dirL == lastTrueDir
+                                    array.set(truePivotsBar, trueN - 1, biMid)
+                                    array.set(truePivotsSynIdx, trueN - 1, midIdx)
+                                    array.set(truePivotsPrice, trueN - 1, penPivotPrice)
+                                    if curShowTrueBi and not na(lastTrueLine)
+                                        line.set_xy2(lastTrueLine, biMid, penPivotPrice)
+                                else
+                                    int lastBarT = array.get(truePivotsBar, trueN - 1)
+                                    int lastSynT = array.get(truePivotsSynIdx, trueN - 1)
+                                    float lastPriceT = array.get(truePivotsPrice, trueN - 1)
+                                    int lenSynT = (midIdx - lastSynT + 1)
+                                    int lenRawT = (biMid - lastBarT + 1)
+                                    int lenUseT = (trueBiLenMode == "raw") ? lenRawT : lenSynT
+                                    bool lenOkT = (not enableTrueBiMinBars) or (lenUseT >= minTrueBiBars)
+                                    if lenOkT
+                                        array.push(truePivotsBar, biMid)
+                                        array.push(truePivotsSynIdx, midIdx)
+                                        array.push(truePivotsPrice, penPivotPrice)
+                                        lastTrueDir := dirL
+                                        if curShowTrueBi
+                                            color cT2 = dirL == 1 ? color.rgb(255, 165, 0) : color.rgb(30, 144, 255)
+                                            lastTrueLine := line.new(lastBarT, lastPriceT, biMid, penPivotPrice, color=cT2, width=2)
+                                            array.push(trueLines, lastTrueLine)
+                                            if maxPenLines == 0
+                                                line oldTrue2 = array.shift(trueLines)
+                                                line.delete(oldTrue2)
+                                            else if array.size(trueLines) > maxPenLines
+                                                line oldTrue2 = array.shift(trueLines)
+                                                line.delete(oldTrue2)
+                                    else
+                                        if liveCommit and enableTrueBiMinBars and showTruePenRejectDebug
+                                            float rejYT1 = isTop ? (y + pad * 0.8) : (y - pad * 0.8)
+                                            string rejT1 = "rej:trueLen" + " use=" + trueBiLenMode + " syn=" + str.tostring(lenSynT) + " raw=" + str.tostring(lenRawT) + " min=" + str.tostring(minTrueBiBars)
+                                            label lpt1 = label.new(biMid, rejYT1, rejT1, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                                            f_keepLabel(penRejectLabels, lpt1)
+
+                        int pcT = array.size(truePivotsPrice)
+                        bool truePivotAppended = (pcT > trueBefore)
+
+                        float epsLiveS = syminfo.mintick * 0.5
+                        if showChanLunRejectDebug and (penPivotType == 1) and (not awaiting3Sell) and not na(zsBreakLow) and (na(lastP3SStateDbgBar) or lastP3SStateDbgBar != biMid)
+                            float yrejNA_S = penPivotPrice + pad + atr14 * zhongshuRejectPadAtr
+                            string outNA_S = "rej:p3s:notAwait" + " allow=" + str.tostring(allowP3S) + " bl=" + str.tostring(zsBreakLow)
+                            label lnaS = label.new(biMid, yrejNA_S, outNA_S, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                            f_keepLabelN(chanLunRejectLabels, lnaS, maxDebugLabels)
+                            lastP3SStateDbgBar := biMid
+                        if awaiting3Sell and not na(zsBreakLow)
+                            if penPivotType == 1
+                                if true
+                                    int pcIdxLiveS = array.size(truePivotsBar)
+                                    awaiting3SellFirstPivotIdx := pcIdxLiveS > 0 ? (pcIdxLiveS - 1) : na
+                                    awaiting3SellFirstPivotBar := biMid
+                                    awaiting3SellFirstPivotPrice := penPivotPrice
+                                    bool wantP3S = showChanLunSignals and showPotential3S and allowP3S
+                                    bool touchP3S = penPivotPrice <= (zsBreakLow + epsLiveS)
+                                    if wantP3S and touchP3S
+                                        float sigPadP3S = atr14 * signalPadAtr
+                                        float yP3S = penPivotPrice + sigPadP3S
+                                        float stepSigP3S = sigPadP3S * 0.8
+                                        if stackDownBar == biMid
+                                            stackDownCount += 1
+                                        else
+                                            stackDownBar := biMid
+                                            stackDownCount := 0
+                                        yP3S := yP3S + stepSigP3S * stackDownCount
+                                        label lp3s = label.new(biMid, yP3S, "P3S", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                        awaiting3SellP3SLabel := lp3s
+                                        f_keepLabelN(p3sLabels, lp3s, maxSignalLabels)
+                                    else if showChanLunRejectDebug and (na(lastP3SMissingDbgBar) or lastP3SMissingDbgBar != biMid)
+                                        float yrejMissS = penPivotPrice + pad + atr14 * zhongshuRejectPadAtr
+                                        string missS = "rej:p3s"
+                                        missS := missS + (not showChanLunSignals ? ":sigOff" : not showPotential3S ? ":p3Off" : not allowP3S ? ":allow" : ":notTouch")
+                                        missS := missS + " p=" + str.tostring(penPivotPrice) + " bl=" + str.tostring(zsBreakLow)
+                                        label lmissS = label.new(biMid, yrejMissS, missS, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                                        f_keepLabelN(chanLunRejectLabels, lmissS, maxDebugLabels)
+                                        lastP3SMissingDbgBar := biMid
+                                if not na(awaiting3SellFirstPivotPrice) and awaiting3SellFirstPivotPrice > (zsBreakLow + epsLiveS)
+                                    if showChanLunRejectDebug
+                                        float yrejP3S = awaiting3SellFirstPivotPrice + pad + atr14 * zhongshuRejectPadAtr
+                                        string outP3S = "rej:p3s>breakLow" + " p=" + str.tostring(awaiting3SellFirstPivotPrice) + " bl=" + str.tostring(zsBreakLow)
+                                        label lrejP3S = label.new(awaiting3SellFirstPivotBar, yrejP3S, outP3S, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                                        f_keepLabelN(chanLunRejectLabels, lrejP3S, maxDebugLabels)
+                                    awaiting3Sell := false
+                                    allowP3S := false
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3SellFirstPivotBar := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3SellP3SLabel := na
+                            else if penPivotType == -1 and not na(awaiting3SellFirstPivotBar) and not na(awaiting3SellFirstPivotPrice)
+                                if awaiting3SellFirstPivotPrice <= (zsBreakLow + epsLiveS)
+                                    if strategy.position_size > 0 and (na(lastStrategyExitBar) or lastStrategyExitBar != bar_index)
+                                        if dbgStrategy and maxDebugLabels > 0
+                                            label lx = f_dbgExitCallLabel(bar_index, high, strategy.position_size, dbgPendingEntryId)
+                                            f_dbgKeepLabel(lx, maxDebugLabels)
+                                        strategy.close("Long")
+                                        lastStrategyExitBar := bar_index
+                                    float sigPadL3S = atr14 * signalPadAtr
+                                    float y3sLive = awaiting3SellFirstPivotPrice + sigPadL3S
+                                    float stepSigL3S = sigPadL3S * 0.8
+                                    if stackDownBar == awaiting3SellFirstPivotBar
+                                        stackDownCount += 1
+                                    else
+                                        stackDownBar := awaiting3SellFirstPivotBar
+                                        stackDownCount := 0
+                                    y3sLive := y3sLive + stepSigL3S * stackDownCount
+                                    if showChanLunSignals
+                                        if showPotential3S
+                                            if na(awaiting3SellP3SLabel)
+                                                label lp3s3 = label.new(awaiting3SellFirstPivotBar, y3sLive, "P3S\n3卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(p3sLabels, lp3s3, maxSignalLabels)
+                                            else
+                                                label.set_text(awaiting3SellP3SLabel, "P3S\n3卖")
+                                                label.set_x(awaiting3SellP3SLabel, awaiting3SellFirstPivotBar)
+                                                label.set_y(awaiting3SellP3SLabel, y3sLive)
+                                                label.set_textcolor(awaiting3SellP3SLabel, color.black)
+                                            awaiting3SellP3SLabel := na
+                                        else
+                                            label l3sLive = label.new(awaiting3SellFirstPivotBar, y3sLive, "3卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                            f_keepLabelN(signalLabels, l3sLive, maxSignalLabels)
+                                    allowP3S := false
+                                    allowP3B := false
+                                    zhongshuSeekDir := -1
+                                    zhongshuNextStartPivot := pcT >= 5 ? (pcT - 5) : 0
+                                    if hasZhongshu
+                                        zhongshuExitConfirmBar := biMid
+                                    int awaiting3SellFirstPivotIdxT = awaiting3SellFirstPivotIdx
+                                    int zhongshuIntersectSpanT = (not na(zhongshuExitEndPivot) and not na(zhongshuEntryStartPivot)) ? (zhongshuExitEndPivot - zhongshuEntryStartPivot) : na
+                                    if not na(awaiting3SellFirstPivotIdxT)
+                                        zhongshuNextStartPivot := awaiting3SellFirstPivotIdxT > 0 ? (awaiting3SellFirstPivotIdxT - 1) : 0
+                                    awaiting3Sell := false
+                                    awaiting3Buy := false
+                                    zhongshuBreakCount := 0
+                                    zhongshuBreakDirCand := 0
+                                    zhongshuBreakHighCand := na
+                                    zhongshuBreakLowCand := na
+                                    zsBreakHigh := na
+                                    zsBreakLow := na
+                                    awaiting3BuyFirstPivotIdx := na
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3BuyFirstPivotPrice := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3BuyFirstPivotBar := na
+                                    awaiting3SellFirstPivotBar := na
+                                    if hasZhongshu
+                                        int pcNowZLiveS = array.size(truePivotsBar)
+                                        int rightBarLiveS = biMid
+                                        if not na(awaiting3SellFirstPivotIdxT)
+                                            int leaveStartLiveS = awaiting3SellFirstPivotIdxT - 2
+                                            int leaveEndLiveS = awaiting3SellFirstPivotIdxT - 1
+                                            bool excludeLeaveLiveS = (zhongshuIntersectCount >= 4) or (not na(zhongshuEntryStartPivot) and (leaveEndLiveS - zhongshuEntryStartPivot) >= 4)
+                                            int rightIdxLiveS = excludeLeaveLiveS ? leaveStartLiveS : leaveEndLiveS
+                                            if rightIdxLiveS >= 0 and rightIdxLiveS < pcNowZLiveS
+                                                rightBarLiveS := array.get(truePivotsBar, rightIdxLiveS)
+                                                zhongshuExitStartPivot := leaveStartLiveS
+                                                zhongshuExitEndPivot := leaveEndLiveS
+                                        if not na(zhongshuBox)
+                                            box.set_right(zhongshuBox, rightBarLiveS)
+                                            box.set_top(zhongshuBox, zhongshuHigh)
+                                            box.set_bottom(zhongshuBox, zhongshuLow)
+                                        if not na(zhongshuBox)
+                                            array.push(zhongshuHistoryBoxes, zhongshuBox)
+                                            if maxZhongshuHistory == 0
+                                                box.delete(zhongshuBox)
+                                                array.pop(zhongshuHistoryBoxes)
+                                            else
+                                                while array.size(zhongshuHistoryBoxes) > maxZhongshuHistory
+                                                    box oldBoxT2 = array.shift(zhongshuHistoryBoxes)
+                                                    box.delete(oldBoxT2)
+                                        if not na(zhongshuInitBox)
+                                            array.push(zhongshuInitHistoryBoxes, zhongshuInitBox)
+                                            if maxZhongshuHistory == 0
+                                                box.delete(zhongshuInitBox)
+                                                array.pop(zhongshuInitHistoryBoxes)
+                                            else
+                                                while array.size(zhongshuInitHistoryBoxes) > maxZhongshuHistory
+                                                    box oldInitT2 = array.shift(zhongshuInitHistoryBoxes)
+                                                    box.delete(oldInitT2)
+                                        hasZhongshu := false
+                                        zhongshuBox := na
+                                        zhongshuInitBox := na
+                                        zhongshuIntersectCount := 0
+                                        zhongshuLowBeforeLast := na
+                                        zhongshuHighBeforeLast := na
+                                        zhongshuEndBarBeforeLast := na
+                                        zhongshuExitStartPivotBeforeLast := na
+                                        zhongshuExitEndPivotBeforeLast := na
+
+                        if showChanLunRejectDebug and (penPivotType == -1) and (not awaiting3Buy) and not na(zsBreakHigh) and (na(lastP3BStateDbgBar) or lastP3BStateDbgBar != biMid)
+                            float yrejNA_B = penPivotPrice - pad - atr14 * zhongshuRejectPadAtr
+                            string outNA_B = "rej:p3b:notAwait" + " allow=" + str.tostring(allowP3B) + " bh=" + str.tostring(zsBreakHigh)
+                            label lnaB = label.new(biMid, yrejNA_B, outNA_B, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                            f_keepLabelN(chanLunRejectLabels, lnaB, maxDebugLabels)
+                            lastP3BStateDbgBar := biMid
+
+                        if awaiting3Buy and not na(zsBreakHigh)
+                            if penPivotType == -1
+                                if true
+                                    int pcIdxLiveB = array.size(truePivotsBar)
+                                    awaiting3BuyFirstPivotIdx := pcIdxLiveB > 0 ? (pcIdxLiveB - 1) : na
+                                    awaiting3BuyFirstPivotBar := biMid
+                                    awaiting3BuyFirstPivotPrice := penPivotPrice
+                                    bool wantP3B = showChanLunSignals and showPotential3B and allowP3B
+                                    bool touchP3B = penPivotPrice >= (zsBreakHigh - epsLiveS)
+                                    if wantP3B and touchP3B
+                                        float sigPadP3B = atr14 * signalPadAtr
+                                        float yP3B = penPivotPrice - sigPadP3B
+                                        float stepSigP3B = sigPadP3B * 0.8
+                                        if stackUpBar == biMid
+                                            stackUpCount += 1
+                                        else
+                                            stackUpBar := biMid
+                                            stackUpCount := 0
+                                        yP3B := yP3B - stepSigP3B * stackUpCount
+                                        label lp3b = label.new(biMid, yP3B, "P3B", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                        awaiting3BuyP3BLabel := lp3b
+                                        f_keepLabelN(p3bLabels, lp3b, maxSignalLabels)
+                                    else if showChanLunRejectDebug and (na(lastP3BMissingDbgBar) or lastP3BMissingDbgBar != biMid)
+                                        float yrejMissB = penPivotPrice - pad - atr14 * zhongshuRejectPadAtr
+                                        string missB = "rej:p3b"
+                                        missB := missB + (not showChanLunSignals ? ":sigOff" : not showPotential3B ? ":p3Off" : not allowP3B ? ":allow" : ":notTouch")
+                                        missB := missB + " p=" + str.tostring(penPivotPrice) + " bh=" + str.tostring(zsBreakHigh)
+                                        label lmissB = label.new(biMid, yrejMissB, missB, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                                        f_keepLabelN(chanLunRejectLabels, lmissB, maxDebugLabels)
+                                        lastP3BMissingDbgBar := biMid
+                                    if not na(awaiting3BuyFirstPivotPrice) and awaiting3BuyFirstPivotPrice < (zsBreakHigh - epsLiveS)
+                                        if showChanLunRejectDebug
+                                            float yrejP3B = awaiting3BuyFirstPivotPrice - pad - atr14 * zhongshuRejectPadAtr
+                                            string outP3B = "rej:p3b<breakHigh" + " p=" + str.tostring(awaiting3BuyFirstPivotPrice) + " bh=" + str.tostring(zsBreakHigh)
+                                            label lrejP3B = label.new(awaiting3BuyFirstPivotBar, yrejP3B, outP3B, style=label.style_label_center, color=color.new(color.gray, 60), textcolor=color.white, size=size.tiny)
+                                            f_keepLabelN(chanLunRejectLabels, lrejP3B, maxDebugLabels)
+                                        awaiting3Buy := false
+                                        allowP3B := false
+                                        awaiting3BuyFirstPivotIdx := na
+                                        awaiting3BuyFirstPivotBar := na
+                                        awaiting3BuyFirstPivotPrice := na
+                                        awaiting3BuyP3BLabel := na
+                            else if penPivotType == 1 and not na(awaiting3BuyFirstPivotBar) and not na(awaiting3BuyFirstPivotPrice)
+                                if awaiting3BuyFirstPivotPrice >= (zsBreakHigh - epsLiveS)
+                                    if (na(lastStrategyEntryBar) or lastStrategyEntryBar != bar_index)
+                                        dbgEntryId += 1
+                                        dbgPendingEntryId := dbgEntryId
+                                        dbgLastEntryCallBar := bar_index
+                                        dbgLastEntryCallId := dbgEntryId
+                                        dbgLastEntryCallOt := strategy.opentrades
+                                        dbgLastEntryCallCt := strategy.closedtrades
+                                        dbgLastEntryCallExitBar := lastStrategyExitBar
+                                        dbgLastEntryCallEquity := strategy.equity
+                                        dbgLastEntryCallTime := time
+                                        dbgLastEntryCallConfirmed := barstate.isconfirmed
+                                        dbgLastEntryCallRealtime := barstate.isrealtime
+                                        dbgLastEntryCallPointValue := syminfo.pointvalue
+                                        dbgLastEntryCallQtyEst := (syminfo.pointvalue != 0 and open != 0) ? (strategy.equity / (open * syminfo.pointvalue)) : na
+                                        if dbgStrategy and maxDebugLabels > 0
+                                            label le = f_dbgEntryCallLabel(bar_index, low, dbgEntryId, awaiting3BuyFirstPivotBar, strategy.position_size, strategy.equity, open, volume, time, barstate.isconfirmed, barstate.isrealtime, syminfo.pointvalue, dbgLastEntryCallQtyEst)
+                                            f_dbgKeepLabel(le, maxDebugLabels)
+                                        strategy.entry("Long", strategy.long)
+                                        lastStrategyEntryBar := bar_index
+                                    float sigPadL3B = atr14 * signalPadAtr
+                                    float y3Live = awaiting3BuyFirstPivotPrice - sigPadL3B
+                                    float stepSigL3B = sigPadL3B * 0.8
+                                    if stackUpBar == awaiting3BuyFirstPivotBar
+                                        stackUpCount += 1
+                                    else
+                                        stackUpBar := awaiting3BuyFirstPivotBar
+                                        stackUpCount := 0
+                                    y3Live := y3Live - stepSigL3B * stackUpCount
+                                    if showChanLunSignals
+                                        if showPotential3B
+                                            if na(awaiting3BuyP3BLabel)
+                                                label lp3b3 = label.new(awaiting3BuyFirstPivotBar, y3Live, "P3B\n3买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(p3bLabels, lp3b3, maxSignalLabels)
+                                            else
+                                                label.set_text(awaiting3BuyP3BLabel, "P3B\n3买")
+                                                label.set_x(awaiting3BuyP3BLabel, awaiting3BuyFirstPivotBar)
+                                                label.set_y(awaiting3BuyP3BLabel, y3Live)
+                                                label.set_textcolor(awaiting3BuyP3BLabel, color.black)
+                                            awaiting3BuyP3BLabel := na
+                                        else
+                                            label l3Live = label.new(awaiting3BuyFirstPivotBar, y3Live, "3买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                            f_keepLabelN(signalLabels, l3Live, maxSignalLabels)
+                                    allowP3B := false
+                                    allowP3S := false
+                                    zhongshuSeekDir := 1
+                                    zhongshuNextStartPivot := pcT >= 5 ? (pcT - 5) : 0
+                                    if hasZhongshu
+                                        zhongshuExitConfirmBar := biMid
+                                    int awaiting3BuyFirstPivotIdxT = awaiting3BuyFirstPivotIdx
+                                    int zhongshuIntersectSpanB = (not na(zhongshuExitEndPivot) and not na(zhongshuEntryStartPivot)) ? (zhongshuExitEndPivot - zhongshuEntryStartPivot) : na
+                                    if not na(awaiting3BuyFirstPivotIdxT)
+                                        zhongshuNextStartPivot := awaiting3BuyFirstPivotIdxT > 0 ? (awaiting3BuyFirstPivotIdxT - 1) : 0
+                                    awaiting3Buy := false
+                                    awaiting3Sell := false
+                                    zhongshuBreakCount := 0
+                                    zhongshuBreakDirCand := 0
+                                    zhongshuBreakHighCand := na
+                                    zhongshuBreakLowCand := na
+                                    zsBreakHigh := na
+                                    zsBreakLow := na
+                                    awaiting3BuyFirstPivotIdx := na
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3BuyFirstPivotPrice := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3BuyFirstPivotBar := na
+                                    awaiting3SellFirstPivotBar := na
+                                    if hasZhongshu
+                                        int pcNowZLiveB = array.size(truePivotsBar)
+                                        int rightBarLiveB = biMid
+                                        if not na(awaiting3BuyFirstPivotIdxT)
+                                            int leaveStartLiveB = awaiting3BuyFirstPivotIdxT - 2
+                                            int leaveEndLiveB = awaiting3BuyFirstPivotIdxT - 1
+                                            bool excludeLeaveLiveB = (zhongshuIntersectCount >= 4) or (not na(zhongshuEntryStartPivot) and (leaveEndLiveB - zhongshuEntryStartPivot) >= 4)
+                                            int rightIdxLiveB = excludeLeaveLiveB ? leaveStartLiveB : leaveEndLiveB
+                                            if rightIdxLiveB >= 0 and rightIdxLiveB < pcNowZLiveB
+                                                rightBarLiveB := array.get(truePivotsBar, rightIdxLiveB)
+                                                zhongshuExitStartPivot := leaveStartLiveB
+                                                zhongshuExitEndPivot := leaveEndLiveB
+                                        if not na(zhongshuBox)
+                                            box.set_right(zhongshuBox, rightBarLiveB)
+                                            box.set_top(zhongshuBox, zhongshuHigh)
+                                            box.set_bottom(zhongshuBox, zhongshuLow)
+                                        if not na(zhongshuBox)
+                                            array.push(zhongshuHistoryBoxes, zhongshuBox)
+                                            if maxZhongshuHistory == 0
+                                                box.delete(zhongshuBox)
+                                                array.pop(zhongshuHistoryBoxes)
+                                            else
+                                                while array.size(zhongshuHistoryBoxes) > maxZhongshuHistory
+                                                    box oldBoxT2 = array.shift(zhongshuHistoryBoxes)
+                                                    box.delete(oldBoxT2)
+                                        if not na(zhongshuInitBox)
+                                            array.push(zhongshuInitHistoryBoxes, zhongshuInitBox)
+                                            if maxZhongshuHistory == 0
+                                                box.delete(zhongshuInitBox)
+                                                array.pop(zhongshuInitHistoryBoxes)
+                                            else
+                                                while array.size(zhongshuInitHistoryBoxes) > maxZhongshuHistory
+                                                    box oldInitT2 = array.shift(zhongshuInitHistoryBoxes)
+                                                    box.delete(oldInitT2)
+                                        hasZhongshu := false
+                                        zhongshuBox := na
+                                        zhongshuInitBox := na
+                                        zhongshuIntersectCount := 0
+                                        zhongshuLowBeforeLast := na
+                                        zhongshuHighBeforeLast := na
+                                        zhongshuEndBarBeforeLast := na
+                                        zhongshuExitStartPivotBeforeLast := na
+                                        zhongshuExitEndPivotBeforeLast := na
+
+                        if showZhongshu and hasZhongshu and not na(zhongshuBox) and not na(zhongshuExitEndPivot)
+                            int pcNowZ = array.size(truePivotsBar)
+                            if zhongshuExitEndPivot >= 0 and zhongshuExitEndPivot < pcNowZ
+                                int rightNowZ = array.get(truePivotsBar, zhongshuExitEndPivot)
+                                box.set_right(zhongshuBox, rightNowZ)
+
+                        if showZhongshu and truePivotAppended
+                            if hasZhongshu and pcT >= 3
+                                float segP2T = array.get(truePivotsPrice, pcT - 3)
+                                float segP3T = array.get(truePivotsPrice, pcT - 2)
+                                float segHT = math.max(segP2T, segP3T)
+                                float segLT = math.min(segP2T, segP3T)
+                                int curBarT = array.get(truePivotsBar, pcT - 2)
+                                float zsLowPrev = zhongshuLow
+                                float zsHighPrev = zhongshuHigh
+                                int segDirZ = segP3T > segP2T ? 1 : segP3T < segP2T ? -1 : 0
+
+                                float zsL2T = math.max(zhongshuLow, segLT)
+                                float zsH2T = math.min(zhongshuHigh, segHT)
+                                int breakDir = (segDirZ == 1 and segHT > zsHighPrev) ? 1 : (segDirZ == -1 and segLT < zsLowPrev) ? -1 : 0
+                                if zsL2T < zsH2T
+                                    if breakDir == 0
+                                        zhongshuLowBeforeLast := zhongshuLow
+                                        zhongshuHighBeforeLast := zhongshuHigh
+                                        zhongshuEndBarBeforeLast := zhongshuEndBar
+                                        zhongshuExitStartPivotBeforeLast := zhongshuExitStartPivot
+                                        zhongshuExitEndPivotBeforeLast := zhongshuExitEndPivot
+                                        zhongshuIntersectCount += 1
+                                        zhongshuLow := zsL2T
+                                        zhongshuHigh := zsH2T
+                                        zhongshuEndBar := curBarT
+                                        zhongshuExitStartPivot := pcT - 3
+                                        zhongshuExitEndPivot := pcT - 2
+                                        zhongshuExitConfirmBar := curBarT
+                                        zhongshuBreakCount := 0
+                                        zhongshuBreakDirCand := 0
+                                        zhongshuBreakHighCand := na
+                                        zhongshuBreakLowCand := na
+                                        awaiting3Buy := false
+                                        awaiting3Sell := false
+                                        allowP3B := false
+                                        allowP3S := false
+                                        zsBreakHigh := na
+                                        zsBreakLow := na
+                                        awaiting3BuyFirstPivotIdx := na
+                                        awaiting3SellFirstPivotIdx := na
+                                        awaiting3BuyFirstPivotPrice := na
+                                        awaiting3SellFirstPivotPrice := na
+                                        awaiting3BuyFirstPivotBar := na
+                                        awaiting3SellFirstPivotBar := na
+                                        awaiting3BuyP3BLabel := na
+                                        awaiting3SellP3SLabel := na
+                                        if not na(zhongshuBox)
+                                            box.set_right(zhongshuBox, zhongshuEndBar)
+                                            box.set_top(zhongshuBox, zhongshuHigh)
+                                            box.set_bottom(zhongshuBox, zhongshuLow)
+                                        if showZhongshuInit and not na(zhongshuInitBox)
+                                            box.set_bgcolor(zhongshuInitBox, color.new(color.rgb(200, 230, 255), 70))
+                                            box.set_border_color(zhongshuInitBox, color.new(color.rgb(60, 140, 220), 0))
+                                    else
+                                        if zhongshuBreakDirCand == 0 or breakDir != zhongshuBreakDirCand
+                                            zhongshuBreakCount := 1
+                                            zhongshuBreakDirCand := breakDir
+                                            zhongshuBreakHighCand := zsHighPrev
+                                            zhongshuBreakLowCand := zsLowPrev
+                                            if breakDir == 1
+                                                awaiting3Buy := true
+                                                awaiting3Sell := false
+                                                allowP3B := true
+                                                allowP3S := false
+                                                awaiting3BuyFirstPivotIdx := na
+                                                awaiting3SellFirstPivotIdx := na
+                                                awaiting3BuyFirstPivotPrice := na
+                                                awaiting3SellFirstPivotPrice := na
+                                                awaiting3BuyFirstPivotBar := na
+                                                awaiting3SellFirstPivotBar := na
+                                                awaiting3BuyP3BLabel := na
+                                                awaiting3SellP3SLabel := na
+                                            else
+                                                awaiting3Sell := true
+                                                awaiting3Buy := false
+                                                allowP3B := false
+                                                allowP3S := true
+                                                awaiting3BuyFirstPivotIdx := na
+                                                awaiting3SellFirstPivotIdx := na
+                                                awaiting3BuyFirstPivotPrice := na
+                                                awaiting3SellFirstPivotPrice := na
+                                                awaiting3BuyFirstPivotBar := na
+                                                awaiting3SellFirstPivotBar := na
+                                                awaiting3BuyP3BLabel := na
+                                                awaiting3SellP3SLabel := na
+                                            zsBreakHigh := zsHighPrev
+                                            zsBreakLow := zsLowPrev
+                                            if breakDir == 1 and penPivotType == -1 and penPivotPrice >= (zsBreakHigh - epsLiveS)
+                                                int pcIdxBrkB1 = array.size(truePivotsBar)
+                                                awaiting3BuyFirstPivotIdx := pcIdxBrkB1 > 0 ? (pcIdxBrkB1 - 1) : na
+                                                awaiting3BuyFirstPivotBar := biMid
+                                                awaiting3BuyFirstPivotPrice := penPivotPrice
+                                                if showChanLunSignals and showPotential3B and allowP3B
+                                                    float sigPadP3B = atr14 * signalPadAtr
+                                                    float yP3B = penPivotPrice - sigPadP3B
+                                                    float stepSigP3B = sigPadP3B * 0.8
+                                                    if stackUpBar == biMid
+                                                        stackUpCount += 1
+                                                    else
+                                                        stackUpBar := biMid
+                                                        stackUpCount := 0
+                                                    yP3B := yP3B - stepSigP3B * stackUpCount
+                                                    label lp3b = label.new(biMid, yP3B, "P3B", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                    awaiting3BuyP3BLabel := lp3b
+                                                    f_keepLabelN(p3bLabels, lp3b, maxSignalLabels)
+                                            if breakDir == -1 and penPivotType == 1 and penPivotPrice <= (zsBreakLow + epsLiveS)
+                                                int pcIdxBrkS1 = array.size(truePivotsBar)
+                                                awaiting3SellFirstPivotIdx := pcIdxBrkS1 > 0 ? (pcIdxBrkS1 - 1) : na
+                                                awaiting3SellFirstPivotBar := biMid
+                                                awaiting3SellFirstPivotPrice := penPivotPrice
+                                                if showChanLunSignals and showPotential3S and allowP3S
+                                                    float sigPadP3S = atr14 * signalPadAtr
+                                                    float yP3S = penPivotPrice + sigPadP3S
+                                                    float stepSigP3S = sigPadP3S * 0.8
+                                                    if stackDownBar == biMid
+                                                        stackDownCount += 1
+                                                    else
+                                                        stackDownBar := biMid
+                                                        stackDownCount := 0
+                                                    yP3S := yP3S + stepSigP3S * stackDownCount
+                                                    label lp3s = label.new(biMid, yP3S, "P3S", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                    awaiting3SellP3SLabel := lp3s
+                                                    f_keepLabelN(p3sLabels, lp3s, maxSignalLabels)
+                                            if showZhongshuRejectDebug
+                                                float dbgZsY = segHT + pad + atr14 * zhongshuRejectPadAtr
+                                                string dbgZs = "zs break(wait3)" + " zs=[" + str.tostring(zsLowPrev) + "," + str.tostring(zsHighPrev) + "]" + " seg=[" + str.tostring(segLT) + "," + str.tostring(segHT) + "]"
+                                                label lz = label.new(curBarT, dbgZsY, dbgZs, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                                                f_keepLabel(zhongshuRejectLabels, lz)
+                                else
+                                    if breakDir != 0
+                                        if zhongshuBreakDirCand == 0 or breakDir != zhongshuBreakDirCand
+                                            zhongshuBreakCount := 1
+                                            zhongshuBreakDirCand := breakDir
+                                            zhongshuBreakHighCand := zsHighPrev
+                                            zhongshuBreakLowCand := zsLowPrev
+                                            if breakDir == 1
+                                                awaiting3Buy := true
+                                                awaiting3Sell := false
+                                                allowP3B := true
+                                                allowP3S := false
+                                                awaiting3BuyFirstPivotIdx := na
+                                                awaiting3SellFirstPivotIdx := na
+                                                awaiting3BuyFirstPivotPrice := na
+                                                awaiting3SellFirstPivotPrice := na
+                                                awaiting3BuyFirstPivotBar := na
+                                                awaiting3SellFirstPivotBar := na
+                                                awaiting3BuyP3BLabel := na
+                                                awaiting3SellP3SLabel := na
+                                            else
+                                                awaiting3Sell := true
+                                                awaiting3Buy := false
+                                                allowP3B := false
+                                                allowP3S := true
+                                                awaiting3BuyFirstPivotIdx := na
+                                                awaiting3SellFirstPivotIdx := na
+                                                awaiting3BuyFirstPivotPrice := na
+                                                awaiting3SellFirstPivotPrice := na
+                                                awaiting3BuyFirstPivotBar := na
+                                                awaiting3SellFirstPivotBar := na
+                                                awaiting3BuyP3BLabel := na
+                                                awaiting3SellP3SLabel := na
+                                            zsBreakHigh := zsHighPrev
+                                            zsBreakLow := zsLowPrev
+                                            if breakDir == 1 and penPivotType == -1 and penPivotPrice >= (zsBreakHigh - epsLiveS)
+                                                int pcIdxBrkB = array.size(truePivotsBar)
+                                                awaiting3BuyFirstPivotIdx := pcIdxBrkB > 0 ? (pcIdxBrkB - 1) : na
+                                                awaiting3BuyFirstPivotBar := biMid
+                                                awaiting3BuyFirstPivotPrice := penPivotPrice
+                                                if showChanLunSignals and showPotential3B and allowP3B
+                                                    float sigPadP3B = atr14 * signalPadAtr
+                                                    float yP3B = penPivotPrice - sigPadP3B
+                                                    float stepSigP3B = sigPadP3B * 0.8
+                                                    if stackUpBar == biMid
+                                                        stackUpCount += 1
+                                                    else
+                                                        stackUpBar := biMid
+                                                        stackUpCount := 0
+                                                    yP3B := yP3B - stepSigP3B * stackUpCount
+                                                    label lp3b = label.new(biMid, yP3B, "P3B", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                    awaiting3BuyP3BLabel := lp3b
+                                                    f_keepLabelN(p3bLabels, lp3b, maxSignalLabels)
+                                            if breakDir == -1 and penPivotType == 1 and penPivotPrice <= (zsBreakLow + epsLiveS)
+                                                int pcIdxBrkS = array.size(truePivotsBar)
+                                                awaiting3SellFirstPivotIdx := pcIdxBrkS > 0 ? (pcIdxBrkS - 1) : na
+                                                awaiting3SellFirstPivotBar := biMid
+                                                awaiting3SellFirstPivotPrice := penPivotPrice
+                                                if showChanLunSignals and showPotential3S and allowP3S
+                                                    float sigPadP3S = atr14 * signalPadAtr
+                                                    float yP3S = penPivotPrice + sigPadP3S
+                                                    float stepSigP3S = sigPadP3S * 0.8
+                                                    if stackDownBar == biMid
+                                                        stackDownCount += 1
+                                                    else
+                                                        stackDownBar := biMid
+                                                        stackDownCount := 0
+                                                    yP3S := yP3S + stepSigP3S * stackDownCount
+                                                    label lp3s = label.new(biMid, yP3S, "P3S", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                    awaiting3SellP3SLabel := lp3s
+                                                    f_keepLabelN(p3sLabels, lp3s, maxSignalLabels)
+                                            if showZhongshuRejectDebug
+                                                float dbgZsY = segHT + pad + atr14 * zhongshuRejectPadAtr
+                                                string dbgZs = "zs break(wait3)" + " zs=[" + str.tostring(zsLowPrev) + "," + str.tostring(zsHighPrev) + "]" + " seg=[" + str.tostring(segLT) + "," + str.tostring(segHT) + "]"
+                                                label lz = label.new(curBarT, dbgZsY, dbgZs, style=label.style_label_center, color=color.new(color.black, 100), textcolor=color.black, size=size.tiny)
+                                                f_keepLabel(zhongshuRejectLabels, lz)
+
+                            if not hasZhongshu
+                                int seekStart = na(zhongshuNextStartPivot) ? 0 : zhongshuNextStartPivot
+                                seekStart := seekStart < 0 ? 0 : seekStart
+                                if pcT >= seekStart + 4
+                                    int foundI = na
+                                    float zsLFound = na
+                                    float zsHFound = na
+                                    for k = 0 to 499
+                                        int i = seekStart + k
+                                        if i > pcT - 4
+                                            break
+                                        float p0T = array.get(truePivotsPrice, i)
+                                        float p1T = array.get(truePivotsPrice, i + 1)
+                                        float p2T = array.get(truePivotsPrice, i + 2)
+                                        float p3T = array.get(truePivotsPrice, i + 3)
+                                        int d1T = p1T > p0T ? 1 : p1T < p0T ? -1 : 0
+                                        int d2T = p2T > p1T ? 1 : p2T < p1T ? -1 : 0
+                                        int d3T = p3T > p2T ? 1 : p3T < p2T ? -1 : 0
+                                        bool dirOkT = (d1T != 0 and d2T != 0 and d3T != 0)
+                                        if zhongshuSeekDir == 1
+                                            dirOkT := dirOkT and (d1T == -1 and d2T == 1 and d3T == -1)
+                                        else if zhongshuSeekDir == -1
+                                            dirOkT := dirOkT and (d1T == 1 and d2T == -1 and d3T == 1)
+                                        float h1T = math.max(p0T, p1T)
+                                        float l1T = math.min(p0T, p1T)
+                                        float h2T = math.max(p1T, p2T)
+                                        float l2T = math.min(p1T, p2T)
+                                        float h3T = math.max(p2T, p3T)
+                                        float l3T = math.min(p2T, p3T)
+                                        float zsLNewT = math.max(l1T, math.max(l2T, l3T))
+                                        float zsHNewT = math.min(h1T, math.min(h2T, h3T))
+                                        if dirOkT and zsLNewT < zsHNewT
+                                            foundI := i
+                                            zsLFound := zsLNewT
+                                            zsHFound := zsHNewT
+                                            break
+                                    if not na(foundI)
+                                        int leftBarT2 = array.get(truePivotsBar, foundI)
+                                        int rightBarT2 = array.get(truePivotsBar, foundI + 3)
+                                        hasZhongshu := true
+                                        zhongshuLow := zsLFound
+                                        zhongshuHigh := zsHFound
+                                        zhongshuStartBar := leftBarT2
+                                        zhongshuEndBar := rightBarT2
+                                        zhongshuEntryStartPivot := foundI
+                                        zhongshuEntryEndPivot := foundI + 1
+                                        zhongshuExitStartPivot := foundI + 2
+                                        zhongshuExitEndPivot := foundI + 3
+                                        zhongshuExitConfirmBar := rightBarT2
+                                        zhongshuIntersectCount := 3
+                                        zhongshuLowBeforeLast := na
+                                        zhongshuHighBeforeLast := na
+                                        zhongshuEndBarBeforeLast := na
+                                        zhongshuExitStartPivotBeforeLast := na
+                                        zhongshuExitEndPivotBeforeLast := na
+                                        zhongshuBreakCount := 0
+                                        zhongshuBreakDirCand := 0
+                                        zhongshuBreakHighCand := na
+                                        zhongshuBreakLowCand := na
+                                        awaiting3Buy := false
+                                        awaiting3Sell := false
+                                        allowP3B := false
+                                        allowP3S := false
+                                        zsBreakHigh := na
+                                        zsBreakLow := na
+                                        awaiting3BuyFirstPivotIdx := na
+                                        awaiting3SellFirstPivotIdx := na
+                                        awaiting3BuyFirstPivotPrice := na
+                                        awaiting3SellFirstPivotPrice := na
+                                        awaiting3BuyFirstPivotBar := na
+                                        awaiting3SellFirstPivotBar := na
+                                        awaiting3BuyP3BLabel := na
+                                        awaiting3SellP3SLabel := na
+                                        zhongshuBox := box.new(zhongshuStartBar, zhongshuHigh, zhongshuEndBar, zhongshuLow, bgcolor=color.new(color.rgb(241, 229, 178), 70), border_color=color.new(color.rgb(220, 180, 60), 70))
+                                        if showZhongshuInit
+                                            zhongshuInitBox := box.new(zhongshuStartBar, zhongshuHigh, zhongshuEndBar, zhongshuLow, bgcolor=color.new(color.rgb(200, 230, 255), 70), border_color=color.new(color.rgb(60, 140, 220), 0))
+
+                            if not hasZhongshu and not na(zsBreakHigh) and not na(zsBreakLow) and pcT >= 3
+                                float segP2R = array.get(truePivotsPrice, pcT - 3)
+                                float segP3R = array.get(truePivotsPrice, pcT - 2)
+                                float segHR = math.max(segP2R, segP3R)
+                                float segLR = math.min(segP2R, segP3R)
+                                int segDirR = segP3R > segP2R ? 1 : segP3R < segP2R ? -1 : 0
+                                int breakDirR = (segDirR == 1 and segHR > zsBreakHigh) ? 1 : (segDirR == -1 and segLR < zsBreakLow) ? -1 : 0
+                                if breakDirR == 0
+                                    zhongshuBreakCount := 0
+                                    zhongshuBreakDirCand := 0
+                                    awaiting3Buy := false
+                                    awaiting3Sell := false
+                                    allowP3B := false
+                                    allowP3S := false
+                                    awaiting3BuyFirstPivotIdx := na
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3BuyFirstPivotPrice := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3BuyFirstPivotBar := na
+                                    awaiting3SellFirstPivotBar := na
+                                    awaiting3BuyP3BLabel := na
+                                    awaiting3SellP3SLabel := na
+                                else
+                                    bool allowOverrideR = (zhongshuSeekDir == 0) or (breakDirR == -zhongshuSeekDir)
+                                    if allowOverrideR and (zhongshuBreakDirCand == 0 or breakDirR != zhongshuBreakDirCand)
+                                        zhongshuBreakCount := 1
+                                        zhongshuBreakDirCand := breakDirR
+                                        if breakDirR == 1
+                                            awaiting3Buy := true
+                                            awaiting3Sell := false
+                                            allowP3B := true
+                                            allowP3S := false
+                                            awaiting3BuyFirstPivotIdx := na
+                                            awaiting3SellFirstPivotIdx := na
+                                            awaiting3BuyFirstPivotPrice := na
+                                            awaiting3SellFirstPivotPrice := na
+                                            awaiting3BuyFirstPivotBar := na
+                                            awaiting3SellFirstPivotBar := na
+                                        else
+                                            awaiting3Sell := true
+                                            awaiting3Buy := false
+                                            allowP3S := true
+                                            allowP3B := false
+                                            awaiting3BuyFirstPivotIdx := na
+                                            awaiting3SellFirstPivotIdx := na
+                                            awaiting3BuyFirstPivotPrice := na
+                                            awaiting3SellFirstPivotPrice := na
+                                            awaiting3BuyFirstPivotBar := na
+                                            awaiting3SellFirstPivotBar := na
+
+                        if truePivotAppended and (showChanLunSignals or showChanLunRejectDebug) and pcT >= 3
+                            int segStartIdx = pcT - 3
+                            int segEndIdx = pcT - 2
+                            int segStartBar = array.get(truePivotsBar, segStartIdx)
+                            int segEndBar = array.get(truePivotsBar, segEndIdx)
+                            float segStartPrice = array.get(truePivotsPrice, segStartIdx)
+                            float segEndPrice = array.get(truePivotsPrice, segEndIdx)
+                            int segDirSig = segEndPrice > segStartPrice ? 1 : segEndPrice < segStartPrice ? -1 : 0
+                            float prevSegStartPrice = segStartIdx >= 1 ? array.get(truePivotsPrice, segStartIdx - 1) : na
+                            int prevSegDirSig = not na(prevSegStartPrice) ? (segStartPrice > prevSegStartPrice ? 1 : segStartPrice < prevSegStartPrice ? -1 : 0) : 0
+                            if segDirSig != 0
+
+                                float segArea = 0.0
+                                float segExt = na
+                                int maxIterSeg = 500
+                                for k = 0 to maxIterSeg - 1
+                                    int bi = segEndBar - k
+                                    if bi < segStartBar
+                                        break
+                                    int off = bar_index - bi
+                                    if off >= 0
+                                        float h = macdHist[off]
+                                        if segDirSig == 1
+                                            float hp = math.max(h, 0)
+                                            segArea += hp
+                                            segExt := na(segExt) ? hp : math.max(segExt, hp)
+                                        else
+                                            float hn = math.min(h, 0)
+                                            segArea += -hn
+                                            segExt := na(segExt) ? hn : math.min(segExt, hn)
+
+                                float prevDownPrice = lastDownPrice
+                                float prevDownArea = lastDownArea
+                                float prevDownExt = lastDownExt
+                                float prevUpPrice = lastUpPrice
+                                float prevUpArea = lastUpArea
+                                float prevUpExt = lastUpExt
+
+                                bool divArea = false
+                                bool divExt = false
+                                if segDirSig == -1
+                                    if not na(prevDownPrice)
+                                        divArea := (segEndPrice < prevDownPrice) and (not na(prevDownArea) and segArea < prevDownArea)
+                                        divExt := (segEndPrice < prevDownPrice) and (not na(prevDownExt) and math.abs(segExt) < math.abs(prevDownExt))
+                                    lastDownPrice := segEndPrice
+                                    lastDownArea := segArea
+                                    lastDownExt := segExt
+                                else
+                                    if not na(prevUpPrice)
+                                        divArea := (segEndPrice > prevUpPrice) and (not na(prevUpArea) and segArea < prevUpArea)
+                                        divExt := (segEndPrice > prevUpPrice) and (not na(prevUpExt) and segExt < prevUpExt)
+                                    lastUpPrice := segEndPrice
+                                    lastUpArea := segArea
+                                    lastUpExt := segExt
+
+                                bool divOk = divergenceMode == "area" ? divArea : divergenceMode == "extreme" ? divExt : (divArea or divExt)
+                                string divTag = divergenceMode == "both" ? (divArea and divExt ? "AE" : divArea ? "A" : divExt ? "E" : "") : ""
+                                float sigPad = atr14 * signalPadAtr
+                                float dbgPadEnd = sigPad * 2.0
+                                float dbgPad3 = sigPad * 3.0
+                                float eps = syminfo.mintick * 0.5
+
+                                if showChanLunRejectDebug
+                                    bool isBuySeg = segDirSig == -1
+                                    bool isSellSeg = segDirSig == 1
+                                    string want = divergenceMode == "both" ? "A|E" : divergenceMode == "area" ? "A" : "E"
+
+                                    bool cand2Buy = isBuySeg and awaiting2Buy and not na(buy1Low) and not na(buy1Bar) and segEndBar > buy1Bar
+                                    bool cand2Sell = isSellSeg and awaiting2Sell and not na(sell1High) and not na(sell1Bar) and segEndBar > sell1Bar
+                                    bool cand3Buy = awaiting3Buy and not na(zsBreakHigh)
+                                    bool cand3Sell = awaiting3Sell and not na(zsBreakLow)
+                                    bool cand3BuyHere = cand3Buy and segDirSig == 1
+                                    bool cand3SellHere = cand3Sell and segDirSig == -1
+
+                                    bool ok1Buy = isBuySeg and divOk
+                                    bool ok1Sell = isSellSeg and divOk
+                                    bool ok2Buy = cand2Buy and (segEndPrice >= buy1Low)
+                                    bool ok2Sell = cand2Sell and (segEndPrice <= sell1High)
+
+                                    bool ok3Buy = cand3BuyHere and (prevSegDirSig == -1) and (segStartPrice >= (zsBreakHigh - eps))
+                                    bool ok3Sell = cand3SellHere and (prevSegDirSig == 1) and (segStartPrice <= (zsBreakLow + eps))
+
+                                    string rej1 = ""
+                                    string rej2 = ""
+                                    string rej3Buy = ""
+                                    string rej3Sell = ""
+                                    if cand3BuyHere and not ok3Buy
+                                        if not (prevSegDirSig == -1)
+                                            rej3Buy := "3买? rej:needFractalPair"
+                                        else
+                                            rej3Buy := "3买? rej:backToZS"
+                                    if cand3SellHere and not ok3Sell
+                                        if not (prevSegDirSig == 1)
+                                            rej3Sell := "3卖? rej:needFractalPair"
+                                        else
+                                            rej3Sell := "3卖? rej:backToZS"
+
+                                    if isBuySeg and not ok1Buy
+                                        if na(prevDownPrice)
+                                            rej1 := "1买? rej:noPrevDown"
+                                        else if not (segEndPrice < prevDownPrice)
+                                            rej1 := "1买? rej:notNewLow"
+                                        else
+                                            rej1 := "1买? rej:noDiv(" + want + ") A=" + (divArea ? "1" : "0") + " E=" + (divExt ? "1" : "0")
+                                    if isSellSeg and not ok1Sell
+                                        if na(prevUpPrice)
+                                            rej1 := "1卖? rej:noPrevUp"
+                                        else if not (segEndPrice > prevUpPrice)
+                                            rej1 := "1卖? rej:notNewHigh"
+                                        else
+                                            rej1 := "1卖? rej:noDiv(" + want + ") A=" + (divArea ? "1" : "0") + " E=" + (divExt ? "1" : "0")
+
+                                    if cand2Buy and not ok2Buy
+                                        rej2 := "2买? rej:<1low"
+                                    if cand2Sell and not ok2Sell
+                                        rej2 := "2卖? rej:>1high"
+
+                                    if chanLunRejectDebugMode == "all"
+                                        string st = "st:Z=" + (hasZhongshu ? "1" : "0") + " A3B=" + (awaiting3Buy ? "1" : "0") + " A3S=" + (awaiting3Sell ? "1" : "0")
+                                        st := st + " BH=" + (na(zsBreakHigh) ? "na" : str.tostring(zsBreakHigh))
+                                        st := st + " BL=" + (na(zsBreakLow) ? "na" : str.tostring(zsBreakLow))
+
+                                        string outEnd = ""
+                                        bool outEndIsBuy = isBuySeg
+                                        if isBuySeg
+                                            outEnd := st
+                                            outEnd := outEnd + (rej1 != "" ? ("\n" + rej1) : "")
+                                            outEnd := outEnd + (rej2 != "" ? ("\n" + rej2) : "")
+                                            outEnd := outEnd + (cand3Buy ? (ok3Buy ? "\n3买:ready" : "\n3买:awaiting") : "")
+                                        else if isSellSeg
+                                            outEndIsBuy := false
+                                            outEnd := st
+                                            outEnd := outEnd + (rej1 != "" ? ("\n" + rej1) : "")
+                                            outEnd := outEnd + (rej2 != "" ? ("\n" + rej2) : "")
+                                            outEnd := outEnd + (cand3Sell ? (ok3Sell ? "\n3卖:ready" : "\n3卖:awaiting") : "")
+                                        if outEnd == st
+                                            outEnd := ""
+
+                                        if outEnd != ""
+                                            bool mergedEnd = f_chanLunAggAppend(outEndIsBuy, segEndBar, outEnd)
+                                            if not mergedEnd
+                                                float yrejEnd = outEndIsBuy ? segEndPrice - dbgPadEnd : segEndPrice + dbgPadEnd
+                                                float stepDbgEnd = sigPad * 0.8
+                                                if outEndIsBuy
+                                                    if dbgStackUpBar == segEndBar
+                                                        dbgStackUpCount += 1
+                                                    else
+                                                        dbgStackUpBar := segEndBar
+                                                        dbgStackUpCount := 0
+                                                    yrejEnd := yrejEnd - stepDbgEnd * dbgStackUpCount
+                                                else
+                                                    if dbgStackDownBar == segEndBar
+                                                        dbgStackDownCount += 1
+                                                    else
+                                                        dbgStackDownBar := segEndBar
+                                                        dbgStackDownCount := 0
+                                                    yrejEnd := yrejEnd + stepDbgEnd * dbgStackDownCount
+                                                f_chanLunAggAdd(outEndIsBuy, segEndBar, yrejEnd, outEnd)
+
+                                        string out3 = ""
+                                        bool out3IsBuy = false
+                                        if cand3BuyHere and rej3Buy != ""
+                                            out3IsBuy := true
+                                            out3 := st + "\n" + rej3Buy
+                                        else if cand3SellHere and rej3Sell != ""
+                                            out3IsBuy := false
+                                            out3 := st + "\n" + rej3Sell
+
+                                        if out3 != ""
+                                            bool merged3 = f_chanLunAggAppend(out3IsBuy, segStartBar, out3)
+                                            if not merged3
+                                                float yrej3 = out3IsBuy ? segStartPrice - dbgPad3 : segStartPrice + dbgPad3
+                                                float stepDbg3 = sigPad * 0.8
+                                                if out3IsBuy
+                                                    if dbgStackUpBar == segStartBar
+                                                        dbgStackUpCount += 1
+                                                    else
+                                                        dbgStackUpBar := segStartBar
+                                                        dbgStackUpCount := 0
+                                                    yrej3 := yrej3 - stepDbg3 * dbgStackUpCount
+                                                else
+                                                    if dbgStackDownBar == segStartBar
+                                                        dbgStackDownCount += 1
+                                                    else
+                                                        dbgStackDownBar := segStartBar
+                                                        dbgStackDownCount := 0
+                                                    yrej3 := yrej3 + stepDbg3 * dbgStackDownCount
+                                                f_chanLunAggAdd(out3IsBuy, segStartBar, yrej3, out3)
+                                    else
+                                        string outBest = ""
+                                        bool outBestIsBuy = isBuySeg
+                                        if cand3BuyHere and rej3Buy != ""
+                                            outBest := rej3Buy
+                                            outBestIsBuy := true
+                                        else if cand3SellHere and rej3Sell != ""
+                                            outBest := rej3Sell
+                                            outBestIsBuy := false
+                                        else if (isBuySeg and rej2 != "") or (isSellSeg and rej2 != "")
+                                            outBest := rej2
+                                            outBestIsBuy := isBuySeg
+                                        else
+                                            outBest := rej1
+                                            outBestIsBuy := isBuySeg
+
+                                        if outBest != ""
+                                            bool mergedBest = f_chanLunAggAppend(outBestIsBuy, segEndBar, outBest)
+                                            if not mergedBest
+                                                float yrejBest = outBestIsBuy ? segEndPrice - dbgPadEnd : segEndPrice + dbgPadEnd
+                                                float stepDbgBest = sigPad * 0.8
+                                                if outBestIsBuy
+                                                    if dbgStackUpBar == segEndBar
+                                                        dbgStackUpCount += 1
+                                                    else
+                                                        dbgStackUpBar := segEndBar
+                                                        dbgStackUpCount := 0
+                                                    yrejBest := yrejBest - stepDbgBest * dbgStackUpCount
+                                                else
+                                                    if dbgStackDownBar == segEndBar
+                                                        dbgStackDownCount += 1
+                                                    else
+                                                        dbgStackDownBar := segEndBar
+                                                        dbgStackDownCount := 0
+                                                    yrejBest := yrejBest + stepDbgBest * dbgStackDownCount
+                                                f_chanLunAggAdd(outBestIsBuy, segEndBar, yrejBest, outBest)
+
+                                if divOk
+                                    if segDirSig == -1
+                                        float y1 = segEndPrice - sigPad
+                                        string t1 = "1买" + (divTag == "" ? "" : "(" + divTag + ")")
+                                        if showChanLunSignals
+                                            float stepSig = sigPad * 0.8
+                                            if stackUpBar == segEndBar
+                                                stackUpCount += 1
+                                            else
+                                                stackUpBar := segEndBar
+                                                stackUpCount := 0
+                                            y1 := y1 - stepSig * stackUpCount
+                                            label l1 = label.new(segEndBar, y1, t1, style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                            f_keepLabelN(signalLabels, l1, maxSignalLabels)
+                                        awaiting2Buy := true
+                                        buy1Low := segEndPrice
+                                        buy1Bar := segEndBar
+                                        awaiting2BuyP2BLabel := na
+                                    else
+                                        float y1s = segEndPrice + sigPad
+                                        string t1s = "1卖" + (divTag == "" ? "" : "(" + divTag + ")")
+                                        if showChanLunSignals
+                                            float stepSigS = sigPad * 0.8
+                                            if stackDownBar == segEndBar
+                                                stackDownCount += 1
+                                            else
+                                                stackDownBar := segEndBar
+                                                stackDownCount := 0
+                                            y1s := y1s + stepSigS * stackDownCount
+                                            label l1s = label.new(segEndBar, y1s, t1s, style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                            f_keepLabelN(signalLabels, l1s, maxSignalLabels)
+                                        awaiting2Sell := true
+                                        sell1High := segEndPrice
+                                        sell1Bar := segEndBar
+                                        awaiting2SellP2SLabel := na
+
+                                if awaiting2Buy and segDirSig == -1 and not na(buy1Low) and not na(buy1Bar) and segEndBar > buy1Bar
+                                    if segEndPrice >= buy1Low
+                                        float y2 = segEndPrice - sigPad
+                                        if showChanLunSignals
+                                            float stepSig2 = sigPad * 0.8
+                                            if stackUpBar == segEndBar
+                                                stackUpCount += 1
+                                            else
+                                                stackUpBar := segEndBar
+                                                stackUpCount := 0
+                                            y2 := y2 - stepSig2 * stackUpCount
+                                            if showPotential2B
+                                                if not na(awaiting2BuyP2BLabel)
+                                                    label.set_text(awaiting2BuyP2BLabel, "P2B\n2买")
+                                                    label.set_x(awaiting2BuyP2BLabel, segEndBar)
+                                                    label.set_y(awaiting2BuyP2BLabel, y2)
+                                                    label.set_textcolor(awaiting2BuyP2BLabel, color.black)
+                                                    awaiting2BuyP2BLabel := na
+                                                else
+                                                    label lp2b2 = label.new(segEndBar, y2, "P2B\n2买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                    f_keepLabelN(p2bLabels, lp2b2, maxSignalLabels)
+                                            else
+                                                label l2 = label.new(segEndBar, y2, "2买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(signalLabels, l2, maxSignalLabels)
+                                    awaiting2Buy := false
+                                    buy1Low := na
+                                    buy1Bar := na
+                                    awaiting2BuyP2BLabel := na
+
+                                if awaiting2Sell and segDirSig == 1 and not na(sell1High) and not na(sell1Bar) and segEndBar > sell1Bar
+                                    if segEndPrice <= sell1High
+                                        float y2s = segEndPrice + sigPad
+                                        if showChanLunSignals
+                                            float stepSig2S = sigPad * 0.8
+                                            if stackDownBar == segEndBar
+                                                stackDownCount += 1
+                                            else
+                                                stackDownBar := segEndBar
+                                                stackDownCount := 0
+                                            y2s := y2s + stepSig2S * stackDownCount
+                                            if showPotential2S
+                                                if not na(awaiting2SellP2SLabel)
+                                                    label.set_text(awaiting2SellP2SLabel, "P2S\n2卖")
+                                                    label.set_x(awaiting2SellP2SLabel, segEndBar)
+                                                    label.set_y(awaiting2SellP2SLabel, y2s)
+                                                    label.set_textcolor(awaiting2SellP2SLabel, color.black)
+                                                    awaiting2SellP2SLabel := na
+                                                else
+                                                    label lp2s2 = label.new(segEndBar, y2s, "P2S\n2卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                    f_keepLabelN(p2sLabels, lp2s2, maxSignalLabels)
+                                            else
+                                                label l2s = label.new(segEndBar, y2s, "2卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(signalLabels, l2s, maxSignalLabels)
+                                    awaiting2Sell := false
+                                    sell1High := na
+                                    sell1Bar := na
+                                    awaiting2SellP2SLabel := na
+
+                                if awaiting3Buy and not na(zsBreakLow) and segEndPrice < zsBreakLow
+                                    awaiting3Buy := false
+                                    awaiting3Sell := true
+                                    allowP3B := false
+                                    allowP3S := true
+                                    awaiting3BuyFirstPivotIdx := na
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3BuyFirstPivotPrice := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3BuyFirstPivotBar := na
+                                    awaiting3SellFirstPivotBar := na
+                                    awaiting3BuyP3BLabel := na
+                                    awaiting3SellP3SLabel := na
+                                if awaiting3Sell and not na(zsBreakHigh) and segEndPrice > zsBreakHigh
+                                    awaiting3Sell := false
+                                    awaiting3Buy := true
+                                    allowP3S := false
+                                    allowP3B := true
+                                    awaiting3BuyFirstPivotIdx := na
+                                    awaiting3SellFirstPivotIdx := na
+                                    awaiting3BuyFirstPivotPrice := na
+                                    awaiting3SellFirstPivotPrice := na
+                                    awaiting3BuyFirstPivotBar := na
+                                    awaiting3SellFirstPivotBar := na
+                                    awaiting3BuyP3BLabel := na
+                                    awaiting3SellP3SLabel := na
+
+                                if awaiting3Buy and segDirSig == 1 and not na(zsBreakHigh)
+                                    if prevSegDirSig == -1 and segStartPrice >= (zsBreakHigh - eps)
+                                        float y3 = segStartPrice - sigPad
+                                        float stepSig3 = sigPad * 0.8
+                                        if showChanLunSignals
+                                            if showPotential3B
+                                                float yP3bT = y3 - sigPad * 0.6
+                                                if stackUpBar == segStartBar
+                                                    stackUpCount += 1
+                                                else
+                                                    stackUpBar := segStartBar
+                                                    stackUpCount := 0
+                                                yP3bT := yP3bT - stepSig3 * stackUpCount
+                                                if not na(awaiting3BuyP3BLabel)
+                                                    label.set_text(awaiting3BuyP3BLabel, "P3B\n3买")
+                                                    label.set_x(awaiting3BuyP3BLabel, segStartBar)
+                                                    label.set_y(awaiting3BuyP3BLabel, yP3bT)
+                                                    label.set_textcolor(awaiting3BuyP3BLabel, color.black)
+                                                    awaiting3BuyP3BLabel := na
+                                                else
+                                                    label lp3bT = label.new(segStartBar, yP3bT, "P3B\n3买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                    f_keepLabelN(p3bLabels, lp3bT, maxSignalLabels)
+                                            else
+                                                if stackUpBar == segStartBar
+                                                    stackUpCount += 1
+                                                else
+                                                    stackUpBar := segStartBar
+                                                    stackUpCount := 0
+                                                y3 := y3 - stepSig3 * stackUpCount
+                                                label l3 = label.new(segStartBar, y3, "3买", style=label.style_label_up, color=color.new(color.red, 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(signalLabels, l3, maxSignalLabels)
+                                        allowP3B := false
+                                        allowP3S := false
+                                        zhongshuSeekDir := 1
+                                        zhongshuNextStartPivot := segStartIdx >= 1 ? (segStartIdx - 1) : 0
+                                        if hasZhongshu
+                                            int zhongshuIntersectSpanSegB = (not na(zhongshuExitEndPivot) and not na(zhongshuEntryStartPivot)) ? (zhongshuExitEndPivot - zhongshuEntryStartPivot) : na
+                                            int leaveStart = segStartIdx - 2
+                                            int leaveEnd = segStartIdx - 1
+                                            if leaveStart >= 0
+                                                bool excludeLeave = (zhongshuIntersectCount >= 4) or (not na(zhongshuEntryStartPivot) and (leaveEnd - zhongshuEntryStartPivot) >= 4)
+                                                zhongshuExitStartPivot := leaveStart
+                                                zhongshuExitEndPivot := leaveEnd
+                                                zhongshuExitConfirmBar := segEndBar
+                                                float zsLowFinal = zhongshuLow
+                                                float zsHighFinal = zhongshuHigh
+                                                int rightFinal = array.get(truePivotsBar, excludeLeave ? leaveStart : leaveEnd)
+                                                if not na(zhongshuBox)
+                                                    box.set_right(zhongshuBox, rightFinal)
+                                                    box.set_top(zhongshuBox, zsHighFinal)
+                                                    box.set_bottom(zhongshuBox, zsLowFinal)
+                                        awaiting3Buy := false
+                                        awaiting3Sell := false
+                                        zhongshuBreakCount := 0
+                                        zhongshuBreakDirCand := 0
+                                        zhongshuBreakHighCand := na
+                                        zhongshuBreakLowCand := na
+                                        zsBreakHigh := na
+                                        zsBreakLow := na
+                                        awaiting3BuyFirstPivotIdx := na
+                                        awaiting3SellFirstPivotIdx := na
+                                        awaiting3BuyFirstPivotPrice := na
+                                        awaiting3SellFirstPivotPrice := na
+                                        awaiting3BuyFirstPivotBar := na
+                                        awaiting3SellFirstPivotBar := na
+                                        if hasZhongshu
+                                            if not na(zhongshuBox)
+                                                array.push(zhongshuHistoryBoxes, zhongshuBox)
+                                                if maxZhongshuHistory == 0
+                                                    box.delete(zhongshuBox)
+                                                    array.pop(zhongshuHistoryBoxes)
+                                                else
+                                                    while array.size(zhongshuHistoryBoxes) > maxZhongshuHistory
+                                                        box oldBoxT2 = array.shift(zhongshuHistoryBoxes)
+                                                        box.delete(oldBoxT2)
+                                            if not na(zhongshuInitBox)
+                                                array.push(zhongshuInitHistoryBoxes, zhongshuInitBox)
+                                                if maxZhongshuHistory == 0
+                                                    box.delete(zhongshuInitBox)
+                                                    array.pop(zhongshuInitHistoryBoxes)
+                                                else
+                                                    while array.size(zhongshuInitHistoryBoxes) > maxZhongshuHistory
+                                                        box oldInitT2 = array.shift(zhongshuInitHistoryBoxes)
+                                                        box.delete(oldInitT2)
+                                            hasZhongshu := false
+                                            zhongshuBox := na
+                                            zhongshuInitBox := na
+                                            zhongshuIntersectCount := 0
+                                            zhongshuLowBeforeLast := na
+                                            zhongshuHighBeforeLast := na
+                                            zhongshuEndBarBeforeLast := na
+                                            zhongshuExitStartPivotBeforeLast := na
+                                            zhongshuExitEndPivotBeforeLast := na
+
+                                if awaiting3Sell and segDirSig == -1 and not na(zsBreakLow)
+                                    if prevSegDirSig == 1 and segStartPrice <= (zsBreakLow + eps)
+                                        if strategy.position_size > 0 and (na(lastStrategyExitBar) or lastStrategyExitBar != bar_index)
+                                            if dbgStrategy and maxDebugLabels > 0
+                                                label lxSeg = f_dbgExitCallSegLabel(bar_index, high, strategy.position_size, dbgPendingEntryId, segStartBar)
+                                                f_dbgKeepLabel(lxSeg, maxDebugLabels)
+                                            strategy.close("Long")
+                                            lastStrategyExitBar := bar_index
+                                        float y3s = segStartPrice + sigPad
+                                        float stepSig3s = sigPad * 0.8
+                                        if showChanLunSignals
+                                            if showPotential3S
+                                                float yP3sT = y3s + sigPad * 0.6
+                                                if stackDownBar == segStartBar
+                                                    stackDownCount += 1
+                                                else
+                                                    stackDownBar := segStartBar
+                                                    stackDownCount := 0
+                                                yP3sT := yP3sT + stepSig3s * stackDownCount
+                                                if not na(awaiting3SellP3SLabel)
+                                                    label.set_text(awaiting3SellP3SLabel, "P3S\n3卖")
+                                                    label.set_x(awaiting3SellP3SLabel, segStartBar)
+                                                    label.set_y(awaiting3SellP3SLabel, yP3sT)
+                                                    label.set_textcolor(awaiting3SellP3SLabel, color.black)
+                                                    awaiting3SellP3SLabel := na
+                                                else
+                                                    label lp3sT = label.new(segStartBar, yP3sT, "P3S\n3卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                    f_keepLabelN(p3sLabels, lp3sT, maxSignalLabels)
+                                            else
+                                                if stackDownBar == segStartBar
+                                                    stackDownCount += 1
+                                                else
+                                                    stackDownBar := segStartBar
+                                                    stackDownCount := 0
+                                                y3s := y3s + stepSig3s * stackDownCount
+                                                label l3s = label.new(segStartBar, y3s, "3卖", style=label.style_label_down, color=color.new(color.rgb(68, 234, 154), 0), textcolor=color.black, size=size.tiny)
+                                                f_keepLabelN(signalLabels, l3s, maxSignalLabels)
+                                        allowP3S := false
+                                        allowP3B := false
+                                        zhongshuSeekDir := -1
+                                        zhongshuNextStartPivot := segStartIdx >= 1 ? (segStartIdx - 1) : 0
+                                        if hasZhongshu
+                                            int zhongshuIntersectSpanSegS = (not na(zhongshuExitEndPivot) and not na(zhongshuEntryStartPivot)) ? (zhongshuExitEndPivot - zhongshuEntryStartPivot) : na
+                                            int leaveStartS = segStartIdx - 2
+                                            int leaveEndS = segStartIdx - 1
+                                            if leaveStartS >= 0
+                                                bool excludeLeaveS = (zhongshuIntersectCount >= 4) or (not na(zhongshuEntryStartPivot) and (leaveEndS - zhongshuEntryStartPivot) >= 4)
+                                                zhongshuExitStartPivot := leaveStartS
+                                                zhongshuExitEndPivot := leaveEndS
+                                                zhongshuExitConfirmBar := segEndBar
+                                                float zsLowFinalS = zhongshuLow
+                                                float zsHighFinalS = zhongshuHigh
+                                                int rightFinalS = array.get(truePivotsBar, excludeLeaveS ? leaveStartS : leaveEndS)
+                                                if not na(zhongshuBox)
+                                                    box.set_right(zhongshuBox, rightFinalS)
+                                                    box.set_top(zhongshuBox, zsHighFinalS)
+                                                    box.set_bottom(zhongshuBox, zsLowFinalS)
+                                        awaiting3Sell := false
+                                        awaiting3Buy := false
+                                        zhongshuBreakCount := 0
+                                        zhongshuBreakDirCand := 0
+                                        zhongshuBreakHighCand := na
+                                        zhongshuBreakLowCand := na
+                                        zsBreakHigh := na
+                                        zsBreakLow := na
+                                        awaiting3BuyFirstPivotIdx := na
+                                        awaiting3SellFirstPivotIdx := na
+                                        awaiting3BuyFirstPivotPrice := na
+                                        awaiting3SellFirstPivotPrice := na
+                                        awaiting3BuyFirstPivotBar := na
+                                        awaiting3SellFirstPivotBar := na
+                                        if hasZhongshu
+                                            if not na(zhongshuBox)
+                                                array.push(zhongshuHistoryBoxes, zhongshuBox)
+                                                if maxZhongshuHistory == 0
+                                                    box.delete(zhongshuBox)
+                                                    array.pop(zhongshuHistoryBoxes)
+                                                else
+                                                    while array.size(zhongshuHistoryBoxes) > maxZhongshuHistory
+                                                        box oldBoxT2 = array.shift(zhongshuHistoryBoxes)
+                                                        box.delete(oldBoxT2)
+                                            if not na(zhongshuInitBox)
+                                                array.push(zhongshuInitHistoryBoxes, zhongshuInitBox)
+                                                if maxZhongshuHistory == 0
+                                                    box.delete(zhongshuInitBox)
+                                                    array.pop(zhongshuInitHistoryBoxes)
+                                                else
+                                                    while array.size(zhongshuInitHistoryBoxes) > maxZhongshuHistory
+                                                        box oldInitT2 = array.shift(zhongshuInitHistoryBoxes)
+                                                        box.delete(oldInitT2)
+                                            hasZhongshu := false
+                                            zhongshuBox := na
+                                            zhongshuInitBox := na
+                                            zhongshuIntersectCount := 0
+                                            zhongshuLowBeforeLast := na
+                                            zhongshuHighBeforeLast := na
+                                            zhongshuEndBarBeforeLast := na
+                                            zhongshuExitStartPivotBeforeLast := na
+                                            zhongshuExitEndPivotBeforeLast := na
+
+                if liveCommit
+                    // mark as pending for possible retract until next synthetic bar append
+                    pendingPrevLastFractalRightSynIdx := lastFractalRightSynIdx
+                    pendingPrevLastFractalMidSynIdx := lastFractalMidSynIdx
+                    pendingPrevLastFractalMidBarIndex := lastFractalMidBarIndex
+                    pendingFractal := false
+                    pendingIsTop := isTop
+                    pendingLeftIdx := leftIdx
+                    pendingMidIdx := midIdx
+                    pendingRightIdx := rightIdx
+                    pendingMidBarIndex := biMid
+                    pendingY := y
+
+                    lastFractalMidBarIndex := biMid
+                    lastFractalRightSynIdx := rightIdx
+                    lastFractalMidSynIdx := midIdx
+
+if strategy.position_size > 0
+    float stopPrice = strategy.position_avg_price * (1.0 - stopLossPct / 100.0)
+    strategy.exit("Long-SL", from_entry="Long", stop=stopPrice)
+
+if dbgStrategy
+    int otNow = strategy.opentrades
+    int ctNow = strategy.closedtrades
+    bool hadPrev = not na(dbgPrevOpenTrades) and not na(dbgPrevClosedTrades)
+    bool filledEntryNow = hadPrev and (otNow > dbgPrevOpenTrades)
+    bool filledExitNow = hadPrev and (ctNow > dbgPrevClosedTrades)
+    if filledEntryNow and maxDebugLabels > 0
+        label lf = label.new(bar_index, low, "dbg:entry fill id=" + str.tostring(dbgPendingEntryId) + " avg=" + str.tostring(strategy.position_avg_price), style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.black, size=size.tiny)
+        f_dbgKeepLabel(lf, maxDebugLabels)
+    if filledExitNow and maxDebugLabels > 0
+        label lc = label.new(bar_index, high, "dbg:exit fill ct=" + str.tostring(ctNow), style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.tiny)
+        f_dbgKeepLabel(lc, maxDebugLabels)
+    bool checkEntryLag = not na(dbgLastEntryCallBar) and (bar_index == dbgLastEntryCallBar + 1)
+    if checkEntryLag
+        bool anyFillProgress = (otNow != dbgLastEntryCallOt) or (ctNow != dbgLastEntryCallCt) or (strategy.position_size != 0)
+        if not anyFillProgress and maxDebugLabels > 0
+            string msg = "dbg:entry NOT filled id=" + str.tostring(dbgLastEntryCallId) + " pos=" + str.tostring(strategy.position_size)
+            msg := msg + " ot=" + str.tostring(otNow) + "(" + str.tostring(dbgLastEntryCallOt) + ")"
+            msg := msg + " ct=" + str.tostring(ctNow) + "(" + str.tostring(dbgLastEntryCallCt) + ")"
+            msg := msg + " lastExitBar=" + str.tostring(dbgLastEntryCallExitBar)
+            msg := msg + " eqNow=" + str.tostring(strategy.equity) + " eqCall=" + str.tostring(dbgLastEntryCallEquity)
+            msg := msg + " o=" + str.tostring(open) + " v=" + str.tostring(volume)
+            msg := msg + " tNow=" + str.tostring(time) + " tCall=" + str.tostring(dbgLastEntryCallTime)
+            msg := msg + " confNow=" + str.tostring(barstate.isconfirmed) + " confCall=" + str.tostring(dbgLastEntryCallConfirmed)
+            msg := msg + " rtNow=" + str.tostring(barstate.isrealtime) + " rtCall=" + str.tostring(dbgLastEntryCallRealtime)
+            msg := msg + " pvCall=" + str.tostring(dbgLastEntryCallPointValue) + " qEstCall=" + str.tostring(dbgLastEntryCallQtyEst)
+            label lnf = label.new(bar_index, low, msg, style=label.style_label_up, color=color.new(color.black, 0), textcolor=color.white, size=size.tiny)
+            f_dbgKeepLabel(lnf, maxDebugLabels)
+        dbgLastEntryCallBar := na
+    dbgPrevOpenTrades := otNow
+    dbgPrevClosedTrades := ctNow
